@@ -6,12 +6,30 @@ export type RuleCheck = {
   title: string;
   status: ComplianceStatus;
   detail: string;
+  /** Value the OCR pass actually read from the label, when any. */
+  extracted?: string;
+  /** File name of the uploaded image the information was detected in. */
+  source?: string;
+  recommendation?: string;
 };
 
 export type Declaration = {
   label: string;
   value: string;
   found: boolean;
+  /** File name of the uploaded image the declaration was detected in. */
+  source?: string;
+};
+
+/** One uploaded file and the raw OCR text read from it. */
+export type ScanPage = {
+  name: string;
+  path: string;
+  ok: boolean;
+  text: string;
+  /** Populated when OCR failed for this file only. */
+  error?: string;
+  quality?: string;
 };
 
 export type AnalysisResult = {
@@ -24,7 +42,10 @@ export type AnalysisResult = {
   status: ComplianceStatus;
   declarations: Declaration[];
   checks: RuleCheck[];
+  pages?: ScanPage[];
+  recommendations?: string[];
 };
+
 
 export const statusLabel: Record<ComplianceStatus, string> = {
   compliant: "Compliant",

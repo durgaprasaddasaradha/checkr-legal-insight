@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   ACCEPTED_MIME_TYPES,
-  MAX_IMAGES,
-  MAX_IMAGE_BYTES,
-  analyzeLabel,
+  MAX_FILES,
+  MAX_FILE_BYTES,
+  SCAN_BUCKET,
+  analyzeScan,
 } from "@/lib/analysis.functions";
 import { saveAnalysis } from "@/lib/analysis-store";
+import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/scan")({
   head: () => ({
@@ -17,12 +19,12 @@ export const Route = createFileRoute("/scan")({
       {
         name: "description",
         content:
-          "Upload or capture packaged product label images and run an automated Legal Metrology compliance analysis.",
+          "Upload or capture multiple packaged product label panels and run a real OCR-based Legal Metrology compliance analysis.",
       },
       { property: "og:title", content: "Scan a product label — VigilMetro" },
       {
         property: "og:description",
-        content: "Drag and drop label images, preview them, and analyse compliance in seconds.",
+        content: "Add front, back and side panels of one product, then analyse compliance in seconds.",
       },
     ],
   }),
@@ -30,86 +32,156 @@ export const Route = createFileRoute("/scan")({
 });
 
 const pipeline = [
-  "Image processing",
+  "Uploading files",
   "Text extraction (OCR)",
-  "Label information detection",
+  "Combining label information",
   "Compliance verification",
   "Report generation",
 ];
 
-type Preview = { id: string; dataUrl: string; name: string };
+type UploadState = "ready" | "uploading" | "uploaded" | "failed";
 
-function readAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
-    reader.readAsDataURL(file);
-  });
+type Selected = {
+  id: string;
+  file: File;
+  name: string;
+  mime: string;
+  preview?: string;
+  state: UploadState;
+  path?: string;
+  message?: string;
+};
+
+function extOk(name: string) {
+  return /\.(jpe?g|png|webp|pdf)$/i.test(name);
 }
 
 function ScanPage() {
   const navigate = useNavigate();
-  const analyze = useServerFn(analyzeLabel);
+  const analyze = useServerFn(analyzeScan);
   const inputRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
-  const [previews, setPreviews] = useState<Preview[]>([]);
+  const [items, setItems] = useState<Selected[]>([]);
   const [dragging, setDragging] = useState(false);
   const [stage, setStage] = useState(-1);
   const [analysing, setAnalysing] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
-  // Advance the visible pipeline while the request is in flight.
   useEffect(() => {
     if (!analysing) return;
-    const t = setInterval(() => setStage((s) => Math.min(s + 1, pipeline.length - 2)), 1200);
+    const t = setInterval(() => setStage((s) => Math.min(s + 1, pipeline.length - 2)), 2500);
     return () => clearInterval(t);
   }, [analysing]);
 
-  async function addFiles(files: FileList | null) {
+  useEffect(
+    () => () => {
+      items.forEach((i) => i.preview && URL.revokeObjectURL(i.preview));
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  function addFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
     setError(undefined);
-    const accepted: Preview[] = [];
+    const accepted: Selected[] = [];
     const rejected: string[] = [];
 
     for (const file of Array.from(files)) {
-      const type = file.type.toLowerCase();
-      const extOk = /\.(jpe?g|png)$/i.test(file.name);
-      if (!(ACCEPTED_MIME_TYPES as readonly string[]).includes(type) && !extOk) {
-        rejected.push(`${file.name} — unsupported format (use JPG, JPEG or PNG)`);
+      const mime = file.type.toLowerCase();
+      const known = (ACCEPTED_MIME_TYPES as readonly string[]).includes(mime);
+      if (!known && !extOk(file.name)) {
+        rejected.push(`${file.name} — unsupported format (use JPG, JPEG, PNG, WEBP or PDF)`);
         continue;
       }
-      if (file.size > MAX_IMAGE_BYTES) {
-        rejected.push(`${file.name} — larger than 6 MB`);
+      if (file.size > MAX_FILE_BYTES) {
+        rejected.push(`${file.name} — larger than 12 MB`);
         continue;
       }
-      try {
-        const dataUrl = await readAsDataUrl(file);
-        accepted.push({ id: `${file.name}-${file.lastModified}-${Math.random()}`, dataUrl, name: file.name });
-      } catch {
-        rejected.push(`${file.name} — could not be read`);
+      if (file.size === 0) {
+        rejected.push(`${file.name} — the file is empty`);
+        continue;
       }
+      const resolvedMime = known
+        ? mime
+        : /\.pdf$/i.test(file.name)
+          ? "application/pdf"
+          : /\.png$/i.test(file.name)
+            ? "image/png"
+            : /\.webp$/i.test(file.name)
+              ? "image/webp"
+              : "image/jpeg";
+      accepted.push({
+        id: `${file.name}-${file.lastModified}-${Math.random()}`,
+        file,
+        name: file.name,
+        mime: resolvedMime,
+        preview: resolvedMime === "application/pdf" ? undefined : URL.createObjectURL(file),
+        state: "ready",
+      });
     }
 
     if (accepted.length > 0) {
-      setPreviews((p) => [...p, ...accepted].slice(0, MAX_IMAGES));
+      setItems((p) => {
+        const room = Math.max(0, MAX_FILES - p.length);
+        if (accepted.length > room) {
+          setError(`Only ${MAX_FILES} files can be analysed in one scan.`);
+        }
+        return [...p, ...accepted.slice(0, room)];
+      });
     }
     if (rejected.length > 0) setError(rejected.join(" · "));
   }
 
-  function removePreview(id: string) {
-    setPreviews((p) => p.filter((x) => x.id !== id));
+  function removeItem(id: string) {
+    setItems((p) => {
+      p.find((x) => x.id === id)?.preview && URL.revokeObjectURL(p.find((x) => x.id === id)!.preview!);
+      return p.filter((x) => x.id !== id);
+    });
   }
 
   async function runAnalysis() {
-    if (previews.length === 0 || analysing) return;
+    if (items.length === 0 || analysing) return;
     setError(undefined);
     setAnalysing(true);
     setStage(0);
+
+    const scanFolder = crypto.randomUUID();
+    const uploaded: { path: string; name: string; mime: string }[] = [];
+    const failures: string[] = [];
+
+    for (const item of items) {
+      setItems((p) => p.map((x) => (x.id === item.id ? { ...x, state: "uploading" } : x)));
+      const ext = item.name.split(".").pop()?.toLowerCase() || "jpg";
+      const path = `${scanFolder}/${crypto.randomUUID()}.${ext}`;
+      const { error: uploadError } = await supabase.storage
+        .from(SCAN_BUCKET)
+        .upload(path, item.file, { contentType: item.mime, upsert: false });
+
+      if (uploadError) {
+        failures.push(item.name);
+        setItems((p) =>
+          p.map((x) =>
+            x.id === item.id ? { ...x, state: "failed", message: uploadError.message } : x,
+          ),
+        );
+        continue;
+      }
+      uploaded.push({ path, name: item.name, mime: item.mime });
+      setItems((p) => p.map((x) => (x.id === item.id ? { ...x, state: "uploaded", path } : x)));
+    }
+
+    if (uploaded.length === 0) {
+      setError("None of the files could be uploaded. Please check your connection and try again.");
+      setAnalysing(false);
+      setStage(-1);
+      return;
+    }
+
+    setStage(1);
+
     try {
-      const response = await analyze({
-        data: { images: previews.map((p) => ({ dataUrl: p.dataUrl, name: p.name })) },
-      });
+      const response = await analyze({ data: { files: uploaded } });
       if (!response.ok) {
         setError(response.error);
         setAnalysing(false);
@@ -117,8 +189,12 @@ function ScanPage() {
         return;
       }
       setStage(pipeline.length);
-      saveAnalysis({ result: response.result, imageDataUrl: previews[0]!.dataUrl });
-      await navigate({ to: "/results" });
+      saveAnalysis({ result: response.result, scanId: response.scanId, files: uploaded });
+      const failedPages = (response.result.pages ?? []).filter((p) => !p.ok).map((p) => p.name);
+      if (failures.length > 0 || failedPages.length > 0) {
+        console.warn("Files skipped:", [...failures, ...failedPages].join(", "));
+      }
+      await navigate({ to: "/results", search: response.scanId ? { id: response.scanId } : {} });
     } catch {
       setError("The analysis request failed. Please check your connection and try again.");
       setAnalysing(false);
@@ -126,7 +202,7 @@ function ScanPage() {
     }
   }
 
-  const canAnalyse = previews.length > 0 && !analysing;
+  const canAnalyse = items.length > 0 && !analysing;
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-10">
@@ -134,8 +210,9 @@ function ScanPage() {
         Scan a packaged product
       </h1>
       <p className="mt-2 max-w-[60ch] text-pretty text-muted-ink">
-        Add clear photographs of the principal display panel and any side panels carrying statutory
-        declarations.
+        Add clear photographs of the front, back, side and any other panels of the{" "}
+        <strong className="text-ink">same product</strong>. All files are analysed together as one
+        packaged commodity.
       </p>
 
       <div className="mt-8 grid gap-6 lg:grid-cols-12">
@@ -149,7 +226,7 @@ function ScanPage() {
             onDrop={(e) => {
               e.preventDefault();
               setDragging(false);
-              void addFiles(e.dataTransfer.files);
+              addFiles(e.dataTransfer.files);
             }}
             className={`rounded-3xl border-2 border-dashed p-10 text-center ${
               dragging ? "border-plum bg-plum/10" : "border-line bg-surface"
@@ -162,7 +239,7 @@ function ScanPage() {
               Drag &amp; drop label images here
             </p>
             <p className="mt-1 text-sm text-muted-ink">
-              JPG, JPEG or PNG · up to {MAX_IMAGES} images · max 6 MB each
+              JPG, JPEG, PNG, WEBP or PDF · up to {MAX_FILES} files · max 12 MB each
             </p>
             <div className="mt-5 flex flex-wrap justify-center gap-3">
               <button
@@ -170,7 +247,7 @@ function ScanPage() {
                 onClick={() => inputRef.current?.click()}
                 className="rounded-full bg-plum px-5 py-2.5 text-sm font-semibold text-surface"
               >
-                Choose files
+                {items.length > 0 ? "Add more files" : "Choose files"}
               </button>
               <button
                 type="button"
@@ -183,42 +260,75 @@ function ScanPage() {
             <input
               ref={inputRef}
               type="file"
-              accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+              accept="image/jpeg,image/png,image/webp,application/pdf,.jpg,.jpeg,.png,.webp,.pdf"
               multiple
               className="hidden"
               onChange={(e) => {
-                void addFiles(e.target.files);
+                addFiles(e.target.files);
                 e.target.value = "";
               }}
             />
             <input
               ref={cameraRef}
               type="file"
-              accept="image/jpeg,image/png"
+              accept="image/jpeg,image/png,image/webp"
               capture="environment"
+              multiple
               className="hidden"
               onChange={(e) => {
-                void addFiles(e.target.files);
+                addFiles(e.target.files);
                 e.target.value = "";
               }}
             />
           </div>
 
-          {previews.length > 0 && (
+          {items.length > 0 && (
             <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {previews.map((p) => (
-                <figure key={p.id} className="relative overflow-hidden rounded-2xl bg-surface ring-1 ring-line">
-                  <img src={p.dataUrl} alt={`Preview of ${p.name}`} className="aspect-[4/5] w-full object-cover" />
+              {items.map((p) => (
+                <figure
+                  key={p.id}
+                  className="relative overflow-hidden rounded-2xl bg-surface ring-1 ring-line"
+                >
+                  {p.preview ? (
+                    <img
+                      src={p.preview}
+                      alt={`Preview of ${p.name}`}
+                      className="aspect-[4/5] w-full object-cover"
+                    />
+                  ) : (
+                    <div className="grid aspect-[4/5] w-full place-items-center bg-soft font-mono text-sm text-plum">
+                      PDF
+                    </div>
+                  )}
                   <button
                     type="button"
-                    onClick={() => removePreview(p.id)}
+                    onClick={() => removeItem(p.id)}
                     disabled={analysing}
                     aria-label={`Remove ${p.name}`}
                     className="absolute right-2 top-2 rounded-full bg-ink/80 px-2 py-1 text-xs font-semibold text-surface disabled:opacity-50"
                   >
                     Remove
                   </button>
-                  <figcaption className="truncate px-3 py-2 text-xs text-muted-ink">{p.name}</figcaption>
+                  <figcaption className="px-3 py-2">
+                    <span className="block truncate text-xs text-muted-ink">{p.name}</span>
+                    <span
+                      className={`text-[11px] font-semibold ${
+                        p.state === "failed"
+                          ? "text-peach"
+                          : p.state === "uploaded"
+                            ? "text-mint"
+                            : "text-muted-ink"
+                      }`}
+                    >
+                      {p.state === "ready"
+                        ? "Ready"
+                        : p.state === "uploading"
+                          ? "Uploading…"
+                          : p.state === "uploaded"
+                            ? "Uploaded"
+                            : `Upload failed${p.message ? ` — ${p.message}` : ""}`}
+                    </span>
+                  </figcaption>
                 </figure>
               ))}
             </div>
@@ -229,9 +339,9 @@ function ScanPage() {
           <div className="rounded-3xl bg-surface p-5 ring-1 ring-line">
             <h2 className="font-display text-lg font-bold text-ink">Analysis</h2>
             <p className="mt-1 text-sm text-muted-ink">
-              {previews.length === 0
-                ? "Add at least one JPG or PNG label image to begin."
-                : `${previews.length} image${previews.length > 1 ? "s" : ""} ready for analysis.`}
+              {items.length === 0
+                ? "Add at least one label file to begin."
+                : `${items.length} file${items.length > 1 ? "s" : ""} of one product ready for analysis.`}
             </p>
 
             {error && (

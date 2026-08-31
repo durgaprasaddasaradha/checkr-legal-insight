@@ -4,14 +4,15 @@ const KEY = "vigilmetro:last-analysis";
 
 export type StoredAnalysis = {
   result: AnalysisResult;
-  imageDataUrl: string;
+  scanId: string;
+  files: { path: string; name: string; mime: string }[];
 };
 
 export function saveAnalysis(value: StoredAnalysis) {
   try {
     sessionStorage.setItem(KEY, JSON.stringify(value));
   } catch {
-    /* storage unavailable — results page falls back to the sample report */
+    /* storage unavailable — results page falls back to the stored scan record */
   }
 }
 
