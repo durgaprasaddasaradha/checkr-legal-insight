@@ -16,13 +16,14 @@ import {
 } from "@/lib/compliance-data";
 import { fetchInspection, formatDate, saveVerification } from "@/lib/inspection-client";
 
-type Search = { id?: string; demo?: boolean };
+type Search = { id?: string | undefined; demo?: boolean | undefined };
 
 export const Route = createFileRoute("/results")({
   validateSearch: (search: Record<string, unknown>): Search => ({
-    id: typeof search.id === "string" ? search.id : undefined,
-    demo: search.demo === true || search.demo === "true",
+    id: typeof search["id"] === "string" ? (search["id"] as string) : undefined,
+    demo: search["demo"] === true || search["demo"] === "true",
   }),
+
   head: () => ({
     meta: [
       { title: "Inspection report — VigilMetro" },
