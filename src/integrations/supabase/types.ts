@@ -14,7 +14,54 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      scans: {
+        Row: {
+          category: string
+          checks: Json
+          created_at: string
+          declarations: Json
+          files: Json
+          id: string
+          manufacturer: string
+          pages: Json
+          product: string
+          recommendations: Json
+          report_id: string
+          score: number
+          status: string
+        }
+        Insert: {
+          category?: string
+          checks?: Json
+          created_at?: string
+          declarations?: Json
+          files?: Json
+          id?: string
+          manufacturer?: string
+          pages?: Json
+          product?: string
+          recommendations?: Json
+          report_id: string
+          score?: number
+          status?: string
+        }
+        Update: {
+          category?: string
+          checks?: Json
+          created_at?: string
+          declarations?: Json
+          files?: Json
+          id?: string
+          manufacturer?: string
+          pages?: Json
+          product?: string
+          recommendations?: Json
+          report_id?: string
+          score?: number
+          status?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
