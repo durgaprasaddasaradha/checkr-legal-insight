@@ -2,53 +2,96 @@ import { createServerFn } from "@tanstack/react-start";
 
 import type { AnalysisResult } from "./compliance-data";
 
-export const MAX_IMAGES = 4;
-export const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
-export const ACCEPTED_MIME_TYPES = ["image/jpeg", "image/jpg", "image/png"] as const;
+export const MAX_FILES = 8;
+export const MAX_FILE_BYTES = 12 * 1024 * 1024;
+export const ACCEPTED_MIME_TYPES = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+] as const;
+export const SCAN_BUCKET = "scan-images";
 
 export type AnalyzeInput = {
-  images: { dataUrl: string; name: string }[];
+  /** Storage paths of the already-uploaded files, all belonging to ONE product. */
+  files: { path: string; name: string; mime: string }[];
 };
 
 export type AnalyzeResponse =
-  | { ok: true; result: AnalysisResult }
+  | { ok: true; result: AnalysisResult; scanId: string }
   | { ok: false; error: string };
 
 function validate(input: AnalyzeInput): AnalyzeInput {
-  if (!input || !Array.isArray(input.images) || input.images.length === 0) {
-    throw new Error("At least one label image is required.");
+  if (!input || !Array.isArray(input.files) || input.files.length === 0) {
+    throw new Error("At least one label file is required.");
   }
-  if (input.images.length > MAX_IMAGES) {
-    throw new Error(`Please upload at most ${MAX_IMAGES} images.`);
+  if (input.files.length > MAX_FILES) {
+    throw new Error(`Please upload at most ${MAX_FILES} files.`);
   }
-  for (const img of input.images) {
-    const match = /^data:(image\/(?:jpeg|jpg|png));base64,/i.exec(img.dataUrl ?? "");
-    if (!match) throw new Error("Only JPG, JPEG and PNG images are supported.");
-    if (img.dataUrl.length * 0.75 > MAX_IMAGE_BYTES) {
-      throw new Error("Each image must be smaller than 6 MB.");
+  for (const f of input.files) {
+    if (!f?.path || typeof f.path !== "string") throw new Error("Invalid upload reference.");
+    if (!(ACCEPTED_MIME_TYPES as readonly string[]).includes(f.mime)) {
+      throw new Error("Only JPG, JPEG, PNG, WEBP and PDF files are supported.");
     }
   }
   return input;
 }
 
 /**
- * Backend integration point: runs OCR + Legal Metrology compliance analysis on
- * the uploaded label images. Swap the implementation in `ocr.server.ts` to plug
- * in a different OCR provider.
+ * Runs the real pipeline: storage download -> OCR per file -> merged extraction
+ * -> Legal Metrology rule engine -> persisted scan history record.
  */
-export const analyzeLabel = createServerFn({ method: "POST" })
+export const analyzeScan = createServerFn({ method: "POST" })
   .inputValidator(validate)
   .handler(async ({ data }): Promise<AnalyzeResponse> => {
-    const { analyzeLabelImages, OcrError } = await import("./ocr.server");
+    const [{ analyzeScanFiles, OcrError }, { supabaseAdmin }] = await Promise.all([
+      import("./ocr.server"),
+      import("@/integrations/supabase/client.server"),
+    ]);
+
     try {
-      const result = await analyzeLabelImages(data.images);
-      return { ok: true, result };
+      const result = await analyzeScanFiles(data.files, async (file) => {
+        const { data: blob, error } = await supabaseAdmin.storage
+          .from(SCAN_BUCKET)
+          .download(file.path);
+        if (error || !blob) throw new Error(error?.message ?? "download failed");
+        const buffer = new Uint8Array(await blob.arrayBuffer());
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < buffer.length; i += chunk) {
+          binary += String.fromCharCode(...buffer.subarray(i, i + chunk));
+        }
+        return `data:${file.mime};base64,${btoa(binary)}`;
+      });
+
+      const { data: row, error: insertError } = await supabaseAdmin
+        .from("scans")
+        .insert({
+          report_id: result.id,
+          product: result.product,
+          manufacturer: result.manufacturer,
+          category: result.category,
+          status: result.status,
+          score: result.score,
+          declarations: result.declarations,
+          checks: result.checks,
+          pages: result.pages ?? [],
+          recommendations: result.recommendations ?? [],
+          files: data.files,
+        })
+        .select("id")
+        .single();
+
+      if (insertError) console.error("[analyzeScan] history insert failed", insertError);
+
+      return { ok: true, result, scanId: row?.id ?? "" };
     } catch (error) {
       const message =
         error instanceof OcrError
           ? error.message
-          : "The image could not be processed. Please try again with a clearer photo.";
-      console.error("[analyzeLabel]", error);
+          : "The analysis could not be completed. Please try again with clearer photos.";
+      console.error("[analyzeScan]", error);
       return { ok: false, error: message };
     }
   });
