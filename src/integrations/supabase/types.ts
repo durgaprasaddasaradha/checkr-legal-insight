@@ -14,53 +14,151 @@ export type Database = {
   }
   public: {
     Tables: {
+      rules: {
+        Row: {
+          active: boolean
+          applicability: string[]
+          created_at: string
+          declaration_type: string
+          effective_date: string
+          id: string
+          requirement: string
+          rule_code: string
+          severity: string
+          source_ref: string
+          updated_at: string
+          validation_method: string
+          version: string
+        }
+        Insert: {
+          active?: boolean
+          applicability?: string[]
+          created_at?: string
+          declaration_type: string
+          effective_date?: string
+          id?: string
+          requirement: string
+          rule_code: string
+          severity?: string
+          source_ref?: string
+          updated_at?: string
+          validation_method?: string
+          version?: string
+        }
+        Update: {
+          active?: boolean
+          applicability?: string[]
+          created_at?: string
+          declaration_type?: string
+          effective_date?: string
+          id?: string
+          requirement?: string
+          rule_code?: string
+          severity?: string
+          source_ref?: string
+          updated_at?: string
+          validation_method?: string
+          version?: string
+        }
+        Relationships: []
+      }
       scans: {
         Row: {
+          brand: string
           category: string
           checks: Json
           created_at: string
           declarations: Json
           files: Json
+          findings: Json
           id: string
+          inspector: string
           manufacturer: string
+          mode: string
+          officer_note: string
+          officer_status: string
+          online_listing: Json | null
           pages: Json
+          parent_scan_id: string | null
+          priority: string
           product: string
+          product_key: string
+          quality: Json
           recommendations: Json
           report_id: string
+          ruleset_version: string
           score: number
+          screening: string
           status: string
+          verified_at: string | null
         }
         Insert: {
+          brand?: string
           category?: string
           checks?: Json
           created_at?: string
           declarations?: Json
           files?: Json
+          findings?: Json
           id?: string
+          inspector?: string
           manufacturer?: string
+          mode?: string
+          officer_note?: string
+          officer_status?: string
+          online_listing?: Json | null
           pages?: Json
+          parent_scan_id?: string | null
+          priority?: string
           product?: string
+          product_key?: string
+          quality?: Json
           recommendations?: Json
           report_id: string
+          ruleset_version?: string
           score?: number
+          screening?: string
           status?: string
+          verified_at?: string | null
         }
         Update: {
+          brand?: string
           category?: string
           checks?: Json
           created_at?: string
           declarations?: Json
           files?: Json
+          findings?: Json
           id?: string
+          inspector?: string
           manufacturer?: string
+          mode?: string
+          officer_note?: string
+          officer_status?: string
+          online_listing?: Json | null
           pages?: Json
+          parent_scan_id?: string | null
+          priority?: string
           product?: string
+          product_key?: string
+          quality?: Json
           recommendations?: Json
           report_id?: string
+          ruleset_version?: string
           score?: number
+          screening?: string
           status?: string
+          verified_at?: string | null
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "scans_parent_scan_id_fkey"
+            columns: ["parent_scan_id"]
+            isOneToOne: false
+            referencedRelation: "scans"
+            referencedColumns: ["id"]
+          },
+        ]
       }
     }
     Views: {
