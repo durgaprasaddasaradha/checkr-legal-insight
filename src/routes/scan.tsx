@@ -46,7 +46,7 @@ type Selected = {
   file: File;
   name: string;
   mime: string;
-  preview?: string;
+  preview?: string | undefined;
   state: UploadState;
   path?: string;
   message?: string;
