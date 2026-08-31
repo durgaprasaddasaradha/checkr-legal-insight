@@ -3,6 +3,9 @@ import { useEffect, useState } from "react";
 
 import labelSnack from "@/assets/label-snack.jpg";
 import { loadAnalysis } from "@/lib/analysis-store";
+import { SCAN_BUCKET } from "@/lib/analysis.functions";
+import { supabase } from "@/integrations/supabase/client";
+
 import { sampleResult, type AnalysisResult } from "@/lib/compliance-data";
 import { StatusDot, StatusPill } from "@/components/StatusPill";
 
