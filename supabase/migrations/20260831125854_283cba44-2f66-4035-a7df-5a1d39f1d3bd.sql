@@ -1,0 +1,2 @@
+CREATE POLICY "Anyone can upload scan images" ON storage.objects FOR INSERT TO anon, authenticated WITH CHECK (bucket_id = 'scan-images');
+CREATE POLICY "Anyone can read scan images" ON storage.objects FOR SELECT TO anon, authenticated USING (bucket_id = 'scan-images');
