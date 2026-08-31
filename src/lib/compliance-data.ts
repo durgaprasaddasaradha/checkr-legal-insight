@@ -150,3 +150,149 @@ export const authorityStats = {
     { label: "Batch code absent", count: 176, width: "40%", color: "bg-sky" },
   ],
 };
+
+/* ------------------------------------------------------------------ *
+ * Inspection platform model (SCAN → EXTRACT → CHECK → EXPLAIN →
+ * VERIFY → RECORD → REPORT). The legacy sample types above are kept
+ * for Demo Mode only.
+ * ------------------------------------------------------------------ */
+
+/** Screening outcome. Never a legal determination — see the report disclaimer. */
+export type ScreeningStatus = "pass" | "review" | "potential-violation";
+
+export const screeningLabel: Record<ScreeningStatus, string> = {
+  pass: "Automated check passed",
+  review: "Manual verification required",
+  "potential-violation": "Potential non-compliance",
+};
+
+export const screeningTone: Record<ScreeningStatus, string> = {
+  pass: "mint",
+  review: "sun",
+  "potential-violation": "peach",
+};
+
+export type PackageSide = "front" | "back" | "left" | "right" | "top" | "bottom" | "other";
+
+export const PACKAGE_SIDES: PackageSide[] = ["front", "back", "left", "right", "top", "bottom", "other"];
+
+export type QualityVerdict = "good" | "warning" | "poor";
+
+/** Normalised (0–1) bounding box, relative to the source image. */
+export type BBox = { x: number; y: number; w: number; h: number };
+
+export type OcrToken = {
+  text: string;
+  /** 0–100, reported by the OCR stage. */
+  confidence: number;
+  bbox: BBox;
+  language?: string | undefined;
+};
+
+export type ImageQuality = {
+  verdict: QualityVerdict;
+  score: number;
+  issues: string[];
+  resolution: string;
+  orientation: string;
+  note: string;
+};
+
+export type InspectionPage = {
+  name: string;
+  path: string;
+  side: PackageSide;
+  ok: boolean;
+  text: string;
+  tokens: OcrToken[];
+  quality: ImageQuality;
+  language: string;
+  error?: string | undefined;
+};
+
+export type DeclarationFinding = {
+  key: string;
+  label: string;
+  value: string;
+  detected: boolean;
+  applicable: boolean;
+  /** OCR confidence for the read text, 0–100. */
+  ocrConfidence: number;
+  /** Confidence that the classifier mapped the text to this declaration, 0–100. */
+  detectionConfidence: number;
+  source?: string | undefined;
+  side?: PackageSide | undefined;
+  bbox?: BBox | undefined;
+  language?: string | undefined;
+};
+
+export type Severity = "high" | "medium" | "low";
+
+export type RuleFinding = {
+  id: string;
+  ruleCode: string;
+  declaration: string;
+  requirement: string;
+  status: ScreeningStatus;
+  severity: Severity;
+  finding: string;
+  extracted: string;
+  ocrConfidence: number;
+  source?: string | undefined;
+  side?: PackageSide | undefined;
+  bbox?: BBox | undefined;
+  ruleRef: string;
+  recommendation: string;
+  applicability: string;
+};
+
+export type OfficerStatus = "pending" | "confirmed" | "rejected" | "review";
+
+export type Inspection = {
+  id: string;
+  scanId?: string;
+  mode: "real" | "demo";
+  product: string;
+  brand: string;
+  manufacturer: string;
+  category: string;
+  categoryKey: string;
+  inspector: string;
+  analyzedAt: string;
+  rulesetVersion: string;
+  screening: ScreeningStatus;
+  priority: Severity;
+  counts: { pass: number; review: number; violation: number };
+  declarations: DeclarationFinding[];
+  findings: RuleFinding[];
+  pages: InspectionPage[];
+  officerStatus?: OfficerStatus | undefined;
+  officerNote?: string | undefined;
+  onlineListing?: OnlineListingComparison | undefined;
+};
+
+export type OnlineListingComparison = {
+  checkedAt: string;
+  rows: {
+    field: string;
+    physical: string;
+    online: string;
+    match: "match" | "mismatch" | "unknown";
+    note: string;
+  }[];
+};
+
+export const DECLARATION_KEYS = [
+  { key: "manufacturer", label: "Manufacturer / packer / importer" },
+  { key: "generic_name", label: "Generic / common product name" },
+  { key: "net_quantity", label: "Net quantity" },
+  { key: "mrp", label: "Retail sale price (MRP)" },
+  { key: "date_declaration", label: "Date of manufacture / packing / import" },
+  { key: "best_before", label: "Best before / use by" },
+  { key: "consumer_care", label: "Consumer care details" },
+  { key: "country_of_origin", label: "Country of origin" },
+  { key: "unit_sale_price", label: "Unit sale price" },
+  { key: "batch_number", label: "Batch / lot number" },
+  { key: "display_panel", label: "Principal display panel grouping" },
+  { key: "font_size", label: "Declaration height / legibility" },
+] as const;

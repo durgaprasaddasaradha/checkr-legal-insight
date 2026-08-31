@@ -1,28 +1,43 @@
-// Backend OCR + Legal Metrology compliance engine.
+// Inspection pipeline (server-only).
 //
-// Flow: storage file -> bytes -> vision OCR (one call per file, raw text only)
-// -> merge/de-duplicate text -> structured extraction + rule evaluation.
+//   image  →  quality check  →  preprocessing hooks  →  OCR (tokens +
+//   confidence + bounding boxes)  →  declaration extraction  →  product
+//   category  →  versioned rule engine  →  screening result + evidence
 //
-// To swap the OCR provider (Google Vision, Textract, an in-house service),
-// replace `ocrFile` only. Everything downstream works on plain text.
+// PROVIDER BOUNDARY
+// ----------------
+// `runOcr()` is the ONLY place that talks to an OCR provider. Today it uses a
+// vision model through the Lovable AI Gateway. To move to the recommended
+// Python stack (FastAPI + OpenCV preprocessing + PaddleOCR, optionally YOLO
+// region detection), set OCR_ENDPOINT and implement `runExternalOcr()` — the
+// response contract (text, confidence, normalised bbox, language) is already
+// exactly what PaddleOCR returns, so nothing downstream changes.
 
 import type {
-  AnalysisResult,
-  ComplianceStatus,
-  Declaration,
-  RuleCheck,
-  ScanPage,
+  BBox,
+  DeclarationFinding,
+  ImageQuality,
+  Inspection,
+  InspectionPage,
+  OcrToken,
+  PackageSide,
+  RuleFinding,
+  ScreeningStatus,
+  Severity,
 } from "./compliance-data";
+import { loadActiveRules, ruleApplies, type RuleRow } from "./rules.server";
 
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
-const OCR_MODEL = "google/gemini-3.7-flash";
-const REASON_MODEL = "google/gemini-3.7-flash";
+const VISION_MODEL = "google/gemini-3.7-flash";
+
+/** Optional external OCR service (FastAPI + OpenCV + PaddleOCR + YOLO). */
+const OCR_ENDPOINT = process.env["OCR_SERVICE_URL"] ?? "";
 
 export type ScanFileInput = {
-  /** Storage object path inside the `scan-images` bucket. */
   path: string;
   name: string;
   mime: string;
+  side: PackageSide;
 };
 
 export class OcrError extends Error {
@@ -34,47 +49,42 @@ export class OcrError extends Error {
   }
 }
 
-function apiKey(): string {
-  const key = process.env["LOVABLE_API_KEY"];
-  if (!key) {
-    throw new OcrError(
-      "The OCR service is not configured (missing API key). Please contact the administrator.",
-      401,
-    );
-  }
-  return key;
-}
+/* ------------------------------------------------------------------ */
+/* Gateway plumbing                                                     */
+/* ------------------------------------------------------------------ */
 
 async function gateway(body: unknown): Promise<string> {
+  const apiKey = process.env["LOVABLE_API_KEY"];
+  if (!apiKey) {
+    throw new OcrError("The analysis service is not configured (missing API key).", 401);
+  }
+
   let response: Response;
   try {
     response = await fetch(GATEWAY_URL, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey()}`,
-        "content-type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify(body),
     });
   } catch {
-    throw new OcrError("Could not reach the OCR service. Please try again.", 503);
+    throw new OcrError("Could not reach the analysis service. Please try again.", 503);
   }
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     if (response.status === 429)
-      throw new OcrError("The OCR service is busy right now. Please retry in a moment.", 429);
+      throw new OcrError("The analysis service is busy. Please retry in a moment.", 429);
     if (response.status === 402)
-      throw new OcrError("The OCR service quota has been exhausted for this workspace.", 402);
+      throw new OcrError("The analysis service quota has been exhausted for this workspace.", 402);
     throw new OcrError(
-      `The OCR service rejected the request (${response.status}). ${text.slice(0, 200)}`,
+      `The analysis service rejected the request (${response.status}). ${text.slice(0, 180)}`,
       response.status,
     );
   }
 
   const payload = (await response.json()) as { choices?: { message?: { content?: string } }[] };
   const content = payload.choices?.[0]?.message?.content;
-  if (!content) throw new OcrError("The OCR service returned an empty response.", 502);
+  if (!content) throw new OcrError("The analysis service returned an empty response.", 502);
   return content;
 }
 
@@ -90,247 +100,433 @@ function parseJson<T>(raw: string): T | undefined {
   }
 }
 
-const OCR_PROMPT = `You are an OCR engine for photographs of packaged commodity labels.
-Transcribe EVERY piece of text you can read in the image, exactly as printed, preserving line breaks.
-Do not summarise, translate, correct or invent text. Do not add commentary.
-Return STRICT JSON only, no markdown fences:
+/* ------------------------------------------------------------------ */
+/* Stage 1 — image quality check + OCR                                  */
+/* ------------------------------------------------------------------ */
+
+const OCR_PROMPT = `You are the image-quality and OCR stage of a Legal Metrology inspection pipeline.
+You receive ONE photograph of a packaged commodity.
+
+STEP 1 — quality assessment. Judge resolution, blur, glare, text visibility, package visibility and orientation.
+STEP 2 — OCR. Transcribe every legible text region exactly as printed. Never translate, correct, complete or invent text.
+
+Return STRICT JSON only (no markdown fences):
 {
-  "readable": boolean,     // false only if no text at all can be read
-  "quality": string,       // short note on legibility issues (blur, glare, cropped, low resolution) or ""
-  "text": string           // the full raw transcription, "" when readable is false
-}`;
-
-/** OCR a single file. Returns raw transcription — never interprets it. */
-async function ocrFile(file: ScanFileInput, dataUrl: string): Promise<ScanPage> {
-  const isPdf = file.mime === "application/pdf";
-  const block = isPdf
-    ? { type: "file", file: { filename: file.name, file_data: dataUrl } }
-    : { type: "image_url", image_url: { url: dataUrl } };
-
-  try {
-    const raw = await gateway({
-      model: OCR_MODEL,
-      messages: [
-        { role: "system", content: OCR_PROMPT },
-        {
-          role: "user",
-          content: [{ type: "text", text: "Transcribe all text on this label." }, block],
-        },
-      ],
-    });
-    const parsed = parseJson<{ readable?: boolean; quality?: string; text?: string }>(raw);
-    if (!parsed) {
-      return { name: file.name, path: file.path, ok: false, text: "", error: "OCR response could not be interpreted." };
+  "quality": {
+    "verdict": "good" | "warning" | "poor",
+    "score": number,               // 0-100 overall capture quality
+    "resolution": string,          // e.g. "adequate", "low"
+    "orientation": string,         // e.g. "upright", "rotated ~90deg", "skewed"
+    "issues": [ string ],          // e.g. "motion blur on lower panel", "glare over MRP area"
+    "note": string
+  },
+  "language": string,              // dominant script/language: "en", "hi", "te", "mixed"
+  "text": string,                  // full raw transcription with line breaks
+  "tokens": [
+    {
+      "text": string,              // one readable line or phrase, exactly as printed
+      "confidence": number,        // 0-100 OCR confidence for THIS text
+      "language": string,          // "en" | "hi" | "te" | other
+      "bbox": { "x": number, "y": number, "w": number, "h": number }  // NORMALISED 0-1, relative to the image
     }
-    const text = (parsed.text ?? "").trim();
-    if (parsed.readable === false || text.length === 0) {
-      return {
-        name: file.name,
-        path: file.path,
-        ok: false,
-        text: "",
-        error: parsed.quality?.trim() || "No readable text could be extracted from this file.",
-      };
-    }
-    return { name: file.name, path: file.path, ok: true, text, quality: parsed.quality?.trim() || "" };
-  } catch (error) {
-    return {
-      name: file.name,
-      path: file.path,
-      ok: false,
-      text: "",
-      error: error instanceof OcrError ? error.message : "OCR failed for this file.",
-    };
-  }
+  ]
 }
 
-const REQUIREMENTS = [
-  "Name and address of the manufacturer / packer / importer (Rule 6(1)(a))",
-  "Common or generic name of the commodity (Rule 6(1)(b))",
-  "Net quantity in standard units (Rule 6(1)(c) & Rule 8)",
-  "Month and year of manufacture / packing / import (Rule 6(1)(d))",
-  "Retail sale price as 'MRP Rs. ___ inclusive of all taxes' (Rule 6(1)(e) & Rule 18)",
-  "Consumer care details — name, address, phone/email (Rule 6(1)(f))",
-  "Country of origin for imported packages (Rule 6(1)(a) proviso)",
-  "Batch / lot / code number where applicable (Rule 6(1))",
-  "Declarations grouped on the principal display panel, legible and conspicuous (Rule 7 & Rule 9)",
-];
+Rules:
+- "poor" means the label text cannot be relied on; say why in issues.
+- bbox values must be fractions of image width/height between 0 and 1.
+- If nothing is readable, return quality.verdict "poor", text "" and tokens [].`;
 
-const COMPLIANCE_PROMPT = `You are a Legal Metrology (Packaged Commodities) Rules, 2011 (India) compliance inspector.
-You are given raw OCR transcriptions of one OR MORE photographs of the SAME single packaged commodity (front, back, side panels).
-Treat them as one product. Merge the information and ignore duplicated text that appears on several panels.
+/** Swap this for the FastAPI/PaddleOCR service when it is available. */
+async function runExternalOcr(file: ScanFileInput, dataUrl: string) {
+  const response = await fetch(`${OCR_ENDPOINT.replace(/\/$/, "")}/ocr`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: file.name, side: file.side, mime: file.mime, image: dataUrl }),
+  });
+  if (!response.ok) throw new OcrError(`OCR service error (${response.status}).`, response.status);
+  return (await response.json()) as OcrPayload;
+}
 
-Requirements to evaluate (skip ones clearly not applicable, e.g. country of origin for a domestic package — mark those compliant only if genuinely not required, otherwise "warning"):
-${REQUIREMENTS.map((r) => `- ${r}`).join("\n")}
+type OcrPayload = {
+  quality?: Partial<ImageQuality>;
+  language?: string;
+  text?: string;
+  tokens?: { text?: string; confidence?: number; language?: string; bbox?: Partial<BBox> }[];
+};
 
-Return STRICT JSON only, no markdown fences:
+async function runOcr(file: ScanFileInput, dataUrl: string): Promise<OcrPayload> {
+  if (OCR_ENDPOINT) return runExternalOcr(file, dataUrl);
+
+  const block =
+    file.mime === "application/pdf"
+      ? { type: "file", file: { filename: file.name, file_data: dataUrl } }
+      : { type: "image_url", image_url: { url: dataUrl } };
+
+  const raw = await gateway({
+    model: VISION_MODEL,
+    messages: [
+      { role: "system", content: OCR_PROMPT },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `This is the ${file.side} side of the package. Assess and transcribe it.` },
+          block,
+        ],
+      },
+    ],
+  });
+  const parsed = parseJson<OcrPayload>(raw);
+  if (!parsed) throw new OcrError("The OCR response could not be interpreted.", 502);
+  return parsed;
+}
+
+function clamp01(n: unknown): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
+  return Math.min(1, Math.max(0, v));
+}
+
+function clampPct(n: unknown, fallback = 0): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : fallback;
+  return Math.round(Math.min(100, Math.max(0, v)));
+}
+
+function toPage(file: ScanFileInput, payload: OcrPayload): InspectionPage {
+  const tokens: OcrToken[] = (payload.tokens ?? [])
+    .map((t) => ({
+      text: (t.text ?? "").trim(),
+      confidence: clampPct(t.confidence, 70),
+      language: t.language?.trim() || payload.language?.trim() || "en",
+      bbox: {
+        x: clamp01(t.bbox?.x),
+        y: clamp01(t.bbox?.y),
+        w: clamp01(t.bbox?.w),
+        h: clamp01(t.bbox?.h),
+      },
+    }))
+    .filter((t) => t.text.length > 0);
+
+  const q = payload.quality ?? {};
+  const verdict = q.verdict === "good" || q.verdict === "warning" || q.verdict === "poor" ? q.verdict : "warning";
+  const text = (payload.text ?? "").trim();
+
+  const quality: ImageQuality = {
+    verdict: text.length === 0 ? "poor" : verdict,
+    score: clampPct(q.score, verdict === "good" ? 85 : 55),
+    issues: Array.isArray(q.issues) ? q.issues.filter((i): i is string => typeof i === "string") : [],
+    resolution: typeof q.resolution === "string" ? q.resolution : "unknown",
+    orientation: typeof q.orientation === "string" ? q.orientation : "unknown",
+    note: typeof q.note === "string" ? q.note : "",
+  };
+
+  return {
+    name: file.name,
+    path: file.path,
+    side: file.side,
+    ok: text.length > 0,
+    text,
+    tokens,
+    quality,
+    language: payload.language?.trim() || "en",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 2 — extraction + versioned rule engine                         */
+/* ------------------------------------------------------------------ */
+
+type EngineOutput = {
+  usable?: boolean;
+  reason?: string;
+  product?: string;
+  brand?: string;
+  manufacturer?: string;
+  category?: string;
+  categoryKey?: string;
+  declarations?: {
+    key?: string;
+    label?: string;
+    value?: string;
+    detected?: boolean;
+    applicable?: boolean;
+    ocrConfidence?: number;
+    detectionConfidence?: number;
+    source?: string;
+    language?: string;
+  }[];
+  findings?: {
+    ruleCode?: string;
+    status?: string;
+    finding?: string;
+    extracted?: string;
+    ocrConfidence?: number;
+    source?: string;
+    recommendation?: string;
+  }[];
+};
+
+function enginePrompt(rules: RuleRow[], version: string): string {
+  const catalogue = rules
+    .map(
+      (r) =>
+        `${r.rule_code} | declaration=${r.declaration_type} | severity=${r.severity} | applies_to=${(r.applicability ?? []).join(",")} | method=${r.validation_method} | ref=${r.source_ref}\n    ${r.requirement}`,
+    )
+    .join("\n");
+
+  return `You are the declaration-extraction and rule-checking stage of a Legal Metrology inspection platform (India).
+You receive OCR output from one or more photographed sides of the SAME package. Treat them as one commodity.
+
+RULE CATALOGUE (ruleset version ${version}) — evaluate ONLY these rules:
+${catalogue}
+
+Return STRICT JSON only (no markdown fences):
 {
-  "usable": boolean,          // false if the combined text is not a packaged commodity label or is too sparse to evaluate
+  "usable": boolean,        // false if this is not a packaged commodity label or the text is far too sparse
   "reason": string,
-  "product": string,          // "" if unknown
-  "commonName": string,
+  "product": string,
+  "brand": string,
   "manufacturer": string,
-  "category": string,
-  "declarations": [ { "label": string, "value": string, "found": boolean, "source": string } ],
-  "checks": [ { "rule": string, "title": string, "status": "compliant"|"warning"|"non-compliant",
-                "extracted": string, "detail": string, "recommendation": string, "source": string } ],
-  "recommendations": [ string ]
+  "category": string,             // human label, e.g. "Packaged food"
+  "categoryKey": "food" | "personal-care" | "household" | "imported" | "ecommerce" | "other",
+  "declarations": [
+    { "key": string,              // declaration_type from the catalogue
+      "label": string,
+      "value": string,            // exactly as printed; "Not detected" when absent
+      "detected": boolean,
+      "applicable": boolean,      // false when the declaration does not apply to this category
+      "ocrConfidence": number,    // 0-100, from the token confidence you used; 0 when not detected
+      "detectionConfidence": number, // 0-100 confidence in this classification
+      "source": string,           // exact file name the value was read from
+      "language": string }
+  ],
+  "findings": [
+    { "ruleCode": string,         // must be a code from the catalogue
+      "status": "pass" | "review" | "potential-violation",
+      "finding": string,          // one or two plain sentences an officer can read
+      "extracted": string,
+      "ocrConfidence": number,
+      "source": string,
+      "recommendation": string }
+  ]
 }
 
-Strict rules:
-- Use ONLY the supplied OCR text. NEVER invent a value that is not present.
-- If a declaration is absent from the text, set found=false and value="Not found", and the matching check status must be "non-compliant".
-- If text exists but is garbled, partial or ambiguous, use status "warning" and detail starting with "Needs manual verification:".
-- "compliant" means the requirement is actually satisfied by readable text, not merely that some text was detected.
-- "source" must be the exact file name (given with each transcription) where the information was read; use "" if unsure.
-- Every declaration listed must also have a corresponding check.`;
+Hard rules:
+- Use ONLY the supplied OCR text. NEVER invent a value.
+- Emit one finding for EVERY catalogue rule that applies to the detected category. Skip rules that do not apply.
+- "pass" = the requirement is demonstrably satisfied by readable text.
+- "potential-violation" = the required declaration is absent or clearly defective.
+- "review" = text is present but ambiguous, partially legible, low confidence, or the rule needs physical measurement (font height, panel grouping).
+- Any rule whose validation_method is "manual-verification" must be "review".
+- "source" must be an exact supplied file name.
+- Never state a legal conclusion. These are automated screening outcomes.`;
+}
 
-export async function analyzeScanFiles(
+/* ------------------------------------------------------------------ */
+/* Orchestration                                                        */
+/* ------------------------------------------------------------------ */
+
+function normStatus(v: unknown): ScreeningStatus {
+  return v === "pass" || v === "review" || v === "potential-violation" ? v : "review";
+}
+
+function normSeverity(v: unknown): Severity {
+  return v === "high" || v === "medium" || v === "low" ? v : "medium";
+}
+
+/** Locate the OCR token that best matches an extracted value, for the evidence viewer. */
+function locate(pages: InspectionPage[], source: string, value: string) {
+  const page = pages.find((p) => p.name === source) ?? pages[0];
+  if (!page) return undefined;
+  const needle = value.toLowerCase().replace(/\s+/g, " ").trim();
+  if (!needle || needle === "not detected") return { page, token: undefined };
+  const token =
+    page.tokens.find((t) => t.text.toLowerCase().includes(needle)) ??
+    page.tokens.find((t) => needle.includes(t.text.toLowerCase()) && t.text.length > 2);
+  return { page, token };
+}
+
+export async function runInspection(
   files: ScanFileInput[],
   fetchBytes: (file: ScanFileInput) => Promise<string>,
-): Promise<AnalysisResult> {
-  // 1. OCR each file independently — one failure must not kill the scan.
-  const pages: ScanPage[] = [];
+  inspector: string,
+): Promise<Inspection> {
+  // Stage 1 — quality + OCR, per image, independently.
+  const pages: InspectionPage[] = [];
   for (const file of files) {
     let dataUrl: string;
     try {
       dataUrl = await fetchBytes(file);
     } catch {
-      pages.push({ name: file.name, path: file.path, ok: false, text: "", error: "The uploaded file could not be read from storage." });
+      pages.push(failedPage(file, "The uploaded file could not be read from storage."));
       continue;
     }
-    pages.push(await ocrFile(file, dataUrl));
+    try {
+      pages.push(toPage(file, await runOcr(file, dataUrl)));
+    } catch (error) {
+      pages.push(failedPage(file, error instanceof OcrError ? error.message : "OCR failed for this file."));
+    }
   }
 
-  const readable = pages.filter((p) => p.ok && p.text.trim().length > 0);
+  const readable = pages.filter((p) => p.ok && p.tokens.length > 0);
   if (readable.length === 0) {
+    const poor = pages.map((p) => p.quality.issues.join("; ")).filter(Boolean).join(" · ");
     throw new OcrError(
-      "Insufficient readable information — Please upload a clearer image of the label panels.",
+      `Insufficient readable information — please capture clearer images of the package.${poor ? ` Detected issues: ${poor}.` : ""}`,
       422,
     );
   }
 
-  // 2. Merge transcriptions, dropping duplicate lines across panels.
+  // Stage 2 — merged, de-duplicated OCR payload for the rule engine.
   const seen = new Set<string>();
-  const combined = readable
+  const merged = readable
     .map((p) => {
-      const lines = p.text
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .filter((l) => {
-          if (!l) return false;
-          const key = l.toLowerCase().replace(/[^a-z0-9]/g, "");
-          if (key.length > 3 && seen.has(key)) return false;
-          if (key.length > 3) seen.add(key);
+      const lines = p.tokens
+        .filter((t) => {
+          const key = t.text.toLowerCase().replace(/[^a-z0-9₹.]/g, "");
+          if (key.length <= 3) return true;
+          if (seen.has(key)) return false;
+          seen.add(key);
           return true;
-        });
-      return `--- FILE: ${p.name} ---\n${lines.join("\n")}`;
+        })
+        .map((t) => `  [conf ${t.confidence}%] ${t.text}`)
+        .join("\n");
+      return `FILE: ${p.name} (side: ${p.side}, capture quality: ${p.quality.verdict})\n${lines}`;
     })
     .join("\n\n");
 
-  if (combined.replace(/--- FILE:.*---/g, "").trim().length < 12) {
-    throw new OcrError(
-      "Insufficient readable information — Please upload a clearer image of the label panels.",
-      422,
-    );
-  }
+  const { rules, version } = await loadActiveRules();
 
-  // 3. Evaluate the merged text against the rules.
   const raw = await gateway({
-    model: REASON_MODEL,
+    model: VISION_MODEL,
     messages: [
-      { role: "system", content: COMPLIANCE_PROMPT },
-      { role: "user", content: `OCR transcriptions of the uploaded panels:\n\n${combined}` },
+      { role: "system", content: enginePrompt(rules, version) },
+      { role: "user", content: `OCR output from the uploaded package sides:\n\n${merged}` },
     ],
   });
-  const parsed = parseJson<ModelOutput>(raw);
-  if (!parsed) throw new OcrError("Could not interpret the compliance engine response.", 502);
-  if (parsed.usable === false) {
+  const engine = parseJson<EngineOutput>(raw);
+  if (!engine) throw new OcrError("The rule engine response could not be interpreted.", 502);
+  if (engine.usable === false) {
     throw new OcrError(
-      parsed.reason?.trim() ||
-        "Insufficient readable information — Please upload a clearer image of the label panels.",
+      engine.reason?.trim() ||
+        "Insufficient readable information — please capture clearer images of the package.",
       422,
     );
   }
 
-  return toAnalysisResult(parsed, pages);
-}
+  const categoryKey = engine.categoryKey?.trim() || "other";
+  const ruleByCode = new Map(rules.map((r) => [r.rule_code, r]));
 
-type ModelOutput = {
-  usable?: boolean;
-  reason?: string;
-  product?: string;
-  commonName?: string;
-  manufacturer?: string;
-  category?: string;
-  declarations?: { label?: string; value?: string; found?: boolean; source?: string }[];
-  checks?: {
-    rule?: string;
-    title?: string;
-    status?: string;
-    extracted?: string;
-    detail?: string;
-    recommendation?: string;
-    source?: string;
-  }[];
-  recommendations?: string[];
-};
+  const declarations: DeclarationFinding[] = (engine.declarations ?? []).map((d) => {
+    const value = d.value?.trim() || "Not detected";
+    const source = d.source?.trim() || "";
+    const hit = locate(pages, source, value);
+    return {
+      key: d.key?.trim() || "other",
+      label: d.label?.trim() || d.key?.trim() || "Declaration",
+      value,
+      detected: d.detected === true,
+      applicable: d.applicable !== false,
+      ocrConfidence: clampPct(d.ocrConfidence, hit?.token?.confidence ?? 0),
+      detectionConfidence: clampPct(d.detectionConfidence, 60),
+      source: hit?.page?.name ?? source,
+      side: hit?.page?.side,
+      bbox: hit?.token?.bbox,
+      language: d.language?.trim() || hit?.token?.language || "en",
+    };
+  });
 
-function normalizeStatus(value: unknown, fallback: ComplianceStatus = "warning"): ComplianceStatus {
-  return value === "compliant" || value === "warning" || value === "non-compliant" ? value : fallback;
-}
+  const findings: RuleFinding[] = [];
+  (engine.findings ?? []).forEach((f, i) => {
+    const rule = ruleByCode.get(f.ruleCode?.trim() ?? "");
+    if (!rule || !ruleApplies(rule, categoryKey)) return;
+    const extracted = f.extracted?.trim() || "Not detected";
+    const hit = locate(pages, f.source?.trim() || "", extracted);
+    const status: ScreeningStatus =
+      rule.validation_method === "manual-verification" ? "review" : normStatus(f.status);
+    findings.push({
+      id: `f${i + 1}`,
+      ruleCode: rule.rule_code,
+      declaration: rule.declaration_type,
+      requirement: rule.requirement,
+      status,
+      severity: normSeverity(rule.severity),
+      finding: f.finding?.trim() || "",
+      extracted,
+      ocrConfidence: clampPct(f.ocrConfidence, hit?.token?.confidence ?? 0),
+      source: hit?.page?.name ?? f.source?.trim() ?? "",
+      side: hit?.page?.side,
+      bbox: hit?.token?.bbox,
+      ruleRef: rule.source_ref,
+      recommendation:
+        f.recommendation?.trim() ||
+        (status === "pass" ? "No action required." : "Manual verification by the inspecting officer."),
+      applicability: (rule.applicability ?? []).join(", "),
+    });
+  });
 
-function toAnalysisResult(m: ModelOutput, pages: ScanPage[]): AnalysisResult {
-  const checks: RuleCheck[] = (m.checks ?? []).map((c, i) => ({
-    id: `c${i + 1}`,
-    rule: c.rule?.trim() || "LMPC 2011",
-    title: c.title?.trim() || "Declaration check",
-    status: normalizeStatus(c.status),
-    detail: c.detail?.trim() || "",
-    extracted: c.extracted?.trim() || "",
-    source: c.source?.trim() || "",
-    recommendation: c.recommendation?.trim() || "",
-  }));
 
-  if (checks.length === 0) {
-    throw new OcrError("No compliance checks could be derived from the extracted text.", 422);
+  if (findings.length === 0) {
+    throw new OcrError("No applicable rule checks could be derived from the extracted text.", 422);
   }
 
-  const declarations: Declaration[] = (m.declarations ?? []).map((d) => ({
-    label: d.label?.trim() || "Declaration",
-    value: d.value?.trim() || "Not found",
-    found: d.found === true,
-    source: d.source?.trim() || "",
-  }));
+  const counts = {
+    pass: findings.filter((f) => f.status === "pass").length,
+    review: findings.filter((f) => f.status === "review").length,
+    violation: findings.filter((f) => f.status === "potential-violation").length,
+  };
+  const screening: ScreeningStatus =
+    counts.violation > 0 ? "potential-violation" : counts.review > 0 ? "review" : "pass";
 
-  const score = Math.round(
-    (checks.reduce(
-      (sum, c) => sum + (c.status === "compliant" ? 1 : c.status === "warning" ? 0.5 : 0),
-      0,
-    ) /
-      checks.length) *
-      100,
-  );
-
-  const hasFail = checks.some((c) => c.status === "non-compliant");
-  const hasWarn = checks.some((c) => c.status === "warning");
-  const status: ComplianceStatus = hasFail ? "non-compliant" : hasWarn ? "warning" : "compliant";
-
-  const recommendations = (m.recommendations ?? [])
-    .map((r) => (typeof r === "string" ? r.trim() : ""))
-    .filter(Boolean);
+  // Inspection prioritisation score — an operational triage signal, NOT a
+  // penalty or guilt score.
+  const highSeverity = findings.filter(
+    (f) => f.status === "potential-violation" && f.severity === "high",
+  ).length;
+  const poorCaptures = pages.filter((p) => p.quality.verdict === "poor").length;
+  const priority: Severity =
+    highSeverity >= 2 || counts.violation >= 4
+      ? "high"
+      : counts.violation > 0 || counts.review >= 3 || poorCaptures > 0
+        ? "medium"
+        : "low";
 
   return {
-    id: `LMR-${new Date().getFullYear()}-${Math.floor(Math.random() * 90000 + 10000)}`,
-    product: m.product?.trim() || "Unable to determine — Manual Verification Required",
-    manufacturer: m.manufacturer?.trim() || "Unable to determine — Manual Verification Required",
-    category: m.category?.trim() || "Uncategorised",
-    analyzedAt: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) + " IST",
-    score,
-    status,
+    id: `LM-${new Date().getFullYear()}-${Math.floor(Math.random() * 900000 + 100000)}`,
+    mode: "real",
+    product: engine.product?.trim() || "Not determined — manual verification required",
+    brand: engine.brand?.trim() || "",
+    manufacturer: engine.manufacturer?.trim() || "Not determined — manual verification required",
+    category: engine.category?.trim() || "Other packaged commodity",
+    categoryKey,
+    inspector,
+    analyzedAt: new Date().toISOString(),
+    rulesetVersion: version,
+    screening,
+    priority,
+    counts,
     declarations,
-    checks,
+    findings,
     pages,
-    recommendations,
+  };
+}
+
+function failedPage(file: ScanFileInput, error: string): InspectionPage {
+  return {
+    name: file.name,
+    path: file.path,
+    side: file.side,
+    ok: false,
+    text: "",
+    tokens: [],
+    quality: {
+      verdict: "poor",
+      score: 0,
+      issues: [error],
+      resolution: "unknown",
+      orientation: "unknown",
+      note: error,
+    },
+    language: "en",
+    error,
   };
 }
