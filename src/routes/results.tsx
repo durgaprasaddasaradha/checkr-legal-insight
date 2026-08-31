@@ -3,6 +3,9 @@ import { useEffect, useState } from "react";
 
 import labelSnack from "@/assets/label-snack.jpg";
 import { loadAnalysis } from "@/lib/analysis-store";
+import { SCAN_BUCKET } from "@/lib/analysis.functions";
+import { supabase } from "@/integrations/supabase/client";
+
 import { sampleResult, type AnalysisResult } from "@/lib/compliance-data";
 import { StatusDot, StatusPill } from "@/components/StatusPill";
 
@@ -30,12 +33,23 @@ function ResultsPage() {
 
   useEffect(() => {
     const stored = loadAnalysis();
-    setState(
-      stored
-        ? { result: stored.result, image: stored.imageDataUrl, live: true }
-        : { result: sampleResult, image: labelSnack, live: false },
-    );
+    if (!stored) {
+      setState({ result: sampleResult, image: labelSnack, live: false });
+      return;
+    }
+    setState({ result: stored.result, image: "", live: true });
+    const first = stored.files.find((f) => f.mime !== "application/pdf");
+    if (!first) return;
+    void supabase.storage
+      .from(SCAN_BUCKET)
+      .createSignedUrl(first.path, 60 * 60)
+      .then(({ data }) => {
+        if (data?.signedUrl) {
+          setState((s) => (s ? { ...s, image: data.signedUrl } : s));
+        }
+      });
   }, []);
+
 
   if (!state) {
     return (
