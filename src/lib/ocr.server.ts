@@ -134,7 +134,7 @@ Return STRICT JSON only (no markdown fences):
 
 Rules:
 - "poor" means the label text cannot be relied on; say why in issues.
-- bbox values must be fractions of image width/height between 0 and 1.
+- bbox must be the TIGHT box around that text: x,y = top-left corner, w,h = width/height, all as decimal fractions of the image (0 to 1, e.g. 0.12). Never output pixel values, never output 1 for every field, and never reuse the same box for two different tokens.
 - If nothing is readable, return quality.verdict "poor", text "" and tokens [].`;
 
 /** Swap this for the FastAPI/PaddleOCR service when it is available. */
