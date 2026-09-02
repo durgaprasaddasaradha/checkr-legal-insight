@@ -1,8 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { BBox, InspectionPage, RuleFinding, ScreeningStatus } from "@/lib/compliance-data";
 import { signedUrl } from "@/lib/inspection-client";
 import { QualityPill } from "./ScreeningPill";
+
+/** A box is usable only when it has real geometry inside the image. */
+function isValidBox(b?: BBox): b is BBox {
+  return (
+    !!b &&
+    b.w > 0.002 &&
+    b.h > 0.002 &&
+    b.x >= 0 &&
+    b.y >= 0 &&
+    b.x < 1 &&
+    b.y < 1 &&
+    b.w <= 1 &&
+    b.h <= 1
+  );
+}
+
 
 export type EvidenceFocus = {
   label: string;
