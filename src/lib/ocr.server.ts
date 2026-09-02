@@ -134,7 +134,7 @@ Return STRICT JSON only (no markdown fences):
 
 Rules:
 - "poor" means the label text cannot be relied on; say why in issues.
-- bbox values must be fractions of image width/height between 0 and 1.
+- bbox must be the TIGHT box around that text: x,y = top-left corner, w,h = width/height, all as decimal fractions of the image (0 to 1, e.g. 0.12). Never output pixel values, never output 1 for every field, and never reuse the same box for two different tokens.
 - If nothing is readable, return quality.verdict "poor", text "" and tokens [].`;
 
 /** Swap this for the FastAPI/PaddleOCR service when it is available. */
@@ -181,14 +181,34 @@ async function runOcr(file: ScanFileInput, dataUrl: string): Promise<OcrPayload>
   return parsed;
 }
 
-function clamp01(n: unknown): number {
-  const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
-  return Math.min(1, Math.max(0, v));
-}
+
 
 function clampPct(n: unknown, fallback = 0): number {
   const v = typeof n === "number" && Number.isFinite(n) ? n : fallback;
   return Math.round(Math.min(100, Math.max(0, v)));
+}
+
+/**
+ * Normalise a model-reported box to 0–1 fractions. Vision models often answer
+ * on a 0–1000 grid (or in raw pixels), which previously clamped to 1 and made
+ * every box invisible. Returns a zeroed box when the geometry is unusable.
+ */
+function normBox(b: Partial<BBox> | undefined): BBox {
+  const nums = [b?.x, b?.y, b?.w, b?.h].map((n) =>
+    typeof n === "number" && Number.isFinite(n) ? n : NaN,
+  );
+  if (nums.some((n) => Number.isNaN(n))) return { x: 0, y: 0, w: 0, h: 0 };
+  const max = Math.max(...nums.map(Math.abs));
+  // 0-1 fractions stay as-is; 0-1000 grids and pixel values get scaled down.
+  const divisor = max <= 1.001 ? 1 : max <= 1000 ? 1000 : max <= 4000 ? 4000 : max;
+  const [x, y, w, h] = nums.map((n) => Math.min(1, Math.max(0, n / divisor))) as [
+    number,
+    number,
+    number,
+    number,
+  ];
+  if (w <= 0.002 || h <= 0.002 || x >= 1 || y >= 1) return { x: 0, y: 0, w: 0, h: 0 };
+  return { x, y, w: Math.min(w, 1 - x), h: Math.min(h, 1 - y) };
 }
 
 function toPage(file: ScanFileInput, payload: OcrPayload): InspectionPage {
@@ -197,14 +217,10 @@ function toPage(file: ScanFileInput, payload: OcrPayload): InspectionPage {
       text: (t.text ?? "").trim(),
       confidence: clampPct(t.confidence, 70),
       language: t.language?.trim() || payload.language?.trim() || "en",
-      bbox: {
-        x: clamp01(t.bbox?.x),
-        y: clamp01(t.bbox?.y),
-        w: clamp01(t.bbox?.w),
-        h: clamp01(t.bbox?.h),
-      },
+      bbox: normBox(t.bbox),
     }))
     .filter((t) => t.text.length > 0);
+
 
   const q = payload.quality ?? {};
   const verdict = q.verdict === "good" || q.verdict === "warning" || q.verdict === "poor" ? q.verdict : "warning";
