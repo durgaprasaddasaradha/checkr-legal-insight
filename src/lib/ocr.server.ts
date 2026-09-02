@@ -181,11 +181,6 @@ async function runOcr(file: ScanFileInput, dataUrl: string): Promise<OcrPayload>
   return parsed;
 }
 
-function clampPct2(n: unknown): number {
-  const v = typeof n === "number" && Number.isFinite(n) ? n : 0;
-  return Math.min(1, Math.max(0, v));
-}
-void clampPct2;
 
 
 function clampPct(n: unknown, fallback = 0): number {
