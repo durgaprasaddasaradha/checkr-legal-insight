@@ -74,3 +74,20 @@ export async function downloadScanFileAsDataUrl(path: string, mime: string): Pro
   const bytes = await downloadBytes(path);
   return `data:${mime};base64,${toBase64(bytes)}`;
 }
+
+/**
+ * Database client for server-side inspection writes: service-role when
+ * available, otherwise the publishable client (the scans table policies allow
+ * anonymous insert/select/update for this no-login enforcement workflow).
+ */
+export async function serverDb(): Promise<SupabaseClient> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // Touch a property so a missing service-role key fails here, not later.
+    void supabaseAdmin.storage;
+    return supabaseAdmin as unknown as SupabaseClient;
+  } catch (error) {
+    console.warn("[serverDb] falling back to publishable client:", error);
+    return publishableServerClient();
+  }
+}
