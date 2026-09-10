@@ -372,8 +372,12 @@ export async function runInspection(
     let dataUrl: string;
     try {
       dataUrl = await fetchBytes(file);
-    } catch {
-      pages.push(failedPage(file, "The uploaded file could not be read from storage."));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error("[runInspection] storage read failed", file.path, detail);
+      pages.push(
+        failedPage(file, `The uploaded file could not be read from storage (${detail}).`),
+      );
       continue;
     }
     try {
