@@ -58,31 +58,20 @@ function productKey(inspection: Inspection): string {
 export const analyzeScan = createServerFn({ method: "POST" })
   .inputValidator(validate)
   .handler(async ({ data }): Promise<AnalyzeResponse> => {
-    const [{ runInspection, OcrError }, { supabaseAdmin }] = await Promise.all([
+    const [{ runInspection, OcrError }, { downloadScanFileAsDataUrl, serverDb }] = await Promise.all([
       import("./ocr.server"),
-      import("@/integrations/supabase/client.server"),
+      import("./storage.server"),
     ]);
+    const db = await serverDb();
 
     try {
       const inspection = await runInspection(
         data.files,
-        async (file) => {
-          const { data: blob, error } = await supabaseAdmin.storage
-            .from(SCAN_BUCKET)
-            .download(file.path);
-          if (error || !blob) throw new Error(error?.message ?? "download failed");
-          const buffer = new Uint8Array(await blob.arrayBuffer());
-          let binary = "";
-          const chunk = 0x8000;
-          for (let i = 0; i < buffer.length; i += chunk) {
-            binary += String.fromCharCode(...buffer.subarray(i, i + chunk));
-          }
-          return `data:${file.mime};base64,${btoa(binary)}`;
-        },
+        (file) => downloadScanFileAsDataUrl(file.path, file.mime),
         data.inspector?.trim() || "Unassigned officer",
       );
 
-      const { data: row, error: insertError } = await supabaseAdmin
+      const { data: row, error: insertError } = await db
         .from("scans")
         .insert({
           report_id: inspection.id,
