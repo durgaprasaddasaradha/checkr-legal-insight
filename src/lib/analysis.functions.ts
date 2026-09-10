@@ -58,31 +58,20 @@ function productKey(inspection: Inspection): string {
 export const analyzeScan = createServerFn({ method: "POST" })
   .inputValidator(validate)
   .handler(async ({ data }): Promise<AnalyzeResponse> => {
-    const [{ runInspection, OcrError }, { supabaseAdmin }] = await Promise.all([
+    const [{ runInspection, OcrError }, { downloadScanFileAsDataUrl, serverDb }] = await Promise.all([
       import("./ocr.server"),
-      import("@/integrations/supabase/client.server"),
+      import("./storage.server"),
     ]);
+    const db = await serverDb();
 
     try {
       const inspection = await runInspection(
         data.files,
-        async (file) => {
-          const { data: blob, error } = await supabaseAdmin.storage
-            .from(SCAN_BUCKET)
-            .download(file.path);
-          if (error || !blob) throw new Error(error?.message ?? "download failed");
-          const buffer = new Uint8Array(await blob.arrayBuffer());
-          let binary = "";
-          const chunk = 0x8000;
-          for (let i = 0; i < buffer.length; i += chunk) {
-            binary += String.fromCharCode(...buffer.subarray(i, i + chunk));
-          }
-          return `data:${file.mime};base64,${btoa(binary)}`;
-        },
+        (file) => downloadScanFileAsDataUrl(file.path, file.mime),
         data.inspector?.trim() || "Unassigned officer",
       );
 
-      const { data: row, error: insertError } = await supabaseAdmin
+      const { data: row, error: insertError } = await db
         .from("scans")
         .insert({
           report_id: inspection.id,
@@ -144,9 +133,10 @@ export const compareListing = createServerFn({ method: "POST" })
     return data;
   })
   .handler(async ({ data }): Promise<{ ok: true; comparison: OnlineListingComparison } | { ok: false; error: string }> => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { serverDb } = await import("./storage.server");
+    const db = await serverDb();
 
-    const { data: row, error } = await supabaseAdmin
+    const { data: row, error } = await db
       .from("scans")
       .select("declarations")
       .eq("id", data.scanId)
@@ -182,7 +172,7 @@ export const compareListing = createServerFn({ method: "POST" })
 
     const comparison: OnlineListingComparison = { checkedAt: new Date().toISOString(), rows };
 
-    await supabaseAdmin
+    await db
       .from("scans")
       .update({ online_listing: { ...comparison, screenshotPath: data.screenshotPath ?? null } })
       .eq("id", data.scanId);
