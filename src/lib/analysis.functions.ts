@@ -133,9 +133,10 @@ export const compareListing = createServerFn({ method: "POST" })
     return data;
   })
   .handler(async ({ data }): Promise<{ ok: true; comparison: OnlineListingComparison } | { ok: false; error: string }> => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { serverDb } = await import("./storage.server");
+    const db = await serverDb();
 
-    const { data: row, error } = await supabaseAdmin
+    const { data: row, error } = await db
       .from("scans")
       .select("declarations")
       .eq("id", data.scanId)
@@ -171,7 +172,7 @@ export const compareListing = createServerFn({ method: "POST" })
 
     const comparison: OnlineListingComparison = { checkedAt: new Date().toISOString(), rows };
 
-    await supabaseAdmin
+    await db
       .from("scans")
       .update({ online_listing: { ...comparison, screenshotPath: data.screenshotPath ?? null } })
       .eq("id", data.scanId);
