@@ -71,7 +71,7 @@ export function visionProvider():
     return {
       url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
       key: gemini,
-      model: read("VISION_MODEL") ?? "gemini-2.5-flash",
+      model: read("VISION_MODEL") ?? "gemini-3.6-flash",
     };
   }
   const openai = read("OPENAI_API_KEY");
