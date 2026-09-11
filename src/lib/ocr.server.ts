@@ -54,9 +54,13 @@ export class OcrError extends Error {
 /* ------------------------------------------------------------------ */
 
 async function gateway(body: unknown): Promise<string> {
-  const apiKey = process.env["LOVABLE_API_KEY"];
+  const { lovableApiKey } = await import("./server-env.server");
+  const apiKey = lovableApiKey();
   if (!apiKey) {
-    throw new OcrError("The analysis service is not configured (missing API key).", 401);
+    throw new OcrError(
+      "The analysis service is not configured on this deployment (missing LOVABLE_API_KEY environment variable).",
+      401,
+    );
   }
 
   let response: Response;
