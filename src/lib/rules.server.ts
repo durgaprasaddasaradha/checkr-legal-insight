@@ -3,7 +3,7 @@
 // The Legal Metrology rule catalogue lives in the `rules` table so it can be
 // updated from the Rule Management page WITHOUT touching the OCR/AI pipeline.
 
-import { supabaseAdmin } from "@/integrations/supabase/client.server";
+import { supabase } from "@/integrations/supabase/client";
 
 export type RuleRow = {
   rule_code: string;
@@ -19,7 +19,7 @@ export type RuleRow = {
 };
 
 export async function loadActiveRules(): Promise<{ rules: RuleRow[]; version: string }> {
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await supabase
     .from("rules")
     .select(
       "rule_code, declaration_type, requirement, applicability, validation_method, severity, effective_date, source_ref, version, active",
