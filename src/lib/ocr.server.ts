@@ -53,26 +53,32 @@ export class OcrError extends Error {
 /* Gateway plumbing                                                     */
 /* ------------------------------------------------------------------ */
 
-async function gateway(body: unknown): Promise<string> {
-  const { lovableApiKey } = await import("./server-env.server");
+async function gateway(body: Record<string, unknown>): Promise<string> {
+  const { lovableApiKey, visionProvider } = await import("./server-env.server");
   const apiKey = lovableApiKey();
-  if (!apiKey) {
+  const fallback = apiKey ? undefined : visionProvider();
+  if (!apiKey && !fallback) {
     throw new OcrError(
-      "The analysis service is not configured on this deployment (missing LOVABLE_API_KEY environment variable).",
+      "The analysis service is not configured on this deployment. Set LOVABLE_API_KEY, or GEMINI_API_KEY / OPENAI_API_KEY, in the hosting environment.",
       401,
     );
   }
 
+  const url = fallback ? fallback.url : GATEWAY_URL;
+  const key = fallback ? fallback.key : apiKey!;
+  const payloadBody = fallback ? { ...body, model: fallback.model } : body;
+
   let response: Response;
   try {
-    response = await fetch(GATEWAY_URL, {
+    response = await fetch(url, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
+      headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify(payloadBody),
     });
   } catch {
     throw new OcrError("Could not reach the analysis service. Please try again.", 503);
   }
+
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");

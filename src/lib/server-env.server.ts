@@ -58,3 +58,30 @@ export function supabaseServiceRoleKey(): string | undefined {
 export function lovableApiKey(): string | undefined {
   return read("LOVABLE_API_KEY");
 }
+
+/**
+ * Fallback vision provider for deployments (e.g. Vercel) that cannot use the
+ * Lovable AI Gateway key. Both use an OpenAI-compatible chat/completions API.
+ */
+export function visionProvider():
+  | { url: string; key: string; model: string }
+  | undefined {
+  const gemini = read("GEMINI_API_KEY", "GOOGLE_API_KEY");
+  if (gemini) {
+    return {
+      url: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      key: gemini,
+      model: read("VISION_MODEL") ?? "gemini-2.5-flash",
+    };
+  }
+  const openai = read("OPENAI_API_KEY");
+  if (openai) {
+    return {
+      url: "https://api.openai.com/v1/chat/completions",
+      key: openai,
+      model: read("VISION_MODEL") ?? "gpt-4o-mini",
+    };
+  }
+  return undefined;
+}
+
