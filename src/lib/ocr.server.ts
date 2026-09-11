@@ -28,6 +28,7 @@ import type {
 import { loadActiveRules, ruleApplies, type RuleRow } from "./rules.server";
 
 const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const VISION_MODEL = "google/gemini-3.7-flash";
 
 /** Optional external OCR service (FastAPI + OpenCV + PaddleOCR + YOLO). */
@@ -55,47 +56,104 @@ export class OcrError extends Error {
 
 async function gateway(body: Record<string, unknown>): Promise<string> {
   const { lovableApiKey, visionProvider } = await import("./server-env.server");
+
+  const openRouterKey = process.env["OPENROUTER_API_KEY"];
   const apiKey = lovableApiKey();
-  const fallback = apiKey ? undefined : visionProvider();
-  if (!apiKey && !fallback) {
+  const fallback = visionProvider();
+
+  if (!openRouterKey && !apiKey && !fallback) {
     throw new OcrError(
-      "The analysis service is not configured on this deployment. Set LOVABLE_API_KEY, or GEMINI_API_KEY / OPENAI_API_KEY, in the hosting environment.",
+      "The analysis service is not configured on this deployment. Set OPENROUTER_API_KEY, LOVABLE_API_KEY, or GEMINI_API_KEY / OPENAI_API_KEY.",
       401,
     );
   }
 
-  const url = fallback ? fallback.url : GATEWAY_URL;
-  const key = fallback ? fallback.key : apiKey!;
-  const payloadBody = fallback ? { ...body, model: fallback.model } : body;
+  // 1. Try OpenRouter free-model router first.
+  if (openRouterKey) {
+    try {
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${openRouterKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://checkr-legal-insight.vercel.app",
+          "X-Title": "PackWise Compliance",
+        },
+        body: JSON.stringify({
+          ...body,
+          model: "openrouter/free",
+        }),
+      });
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "content-type": "application/json" },
-      body: JSON.stringify(payloadBody),
-    });
-  } catch {
-    throw new OcrError("Could not reach the analysis service. Please try again.", 503);
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        const content = payload.choices?.[0]?.message?.content;
+
+        if (content) return content;
+      }
+    } catch (error) {
+      console.error("[gateway] OpenRouter failed, trying backup provider", error);
+    }
   }
 
+  // 2. Try existing Lovable AI Gateway.
+  if (apiKey) {
+    try {
+      const response = await fetch(GATEWAY_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    if (response.status === 429)
-      throw new OcrError("The analysis service is busy. Please retry in a moment.", 429);
-    if (response.status === 402)
-      throw new OcrError("The analysis service quota has been exhausted for this workspace.", 402);
-    throw new OcrError(
-      `The analysis service rejected the request (${response.status}). ${text.slice(0, 180)}`,
-      response.status,
-    );
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        const content = payload.choices?.[0]?.message?.content;
+
+        if (content) return content;
+      }
+    } catch (error) {
+      console.error("[gateway] Lovable AI failed, trying backup provider", error);
+    }
   }
 
-  const payload = (await response.json()) as { choices?: { message?: { content?: string } }[] };
-  const content = payload.choices?.[0]?.message?.content;
-  if (!content) throw new OcrError("The analysis service returned an empty response.", 502);
-  return content;
+  // 3. Try Gemini/OpenAI configured in Vercel.
+  if (fallback) {
+    try {
+      const payloadBody = { ...body, model: fallback.model };
+
+      const response = await fetch(fallback.url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${fallback.key}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payloadBody),
+      });
+
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        const content = payload.choices?.[0]?.message?.content;
+
+        if (content) return content;
+      }
+    } catch (error) {
+      console.error("[gateway] Backup AI provider failed", error);
+    }
+  }
+
+  throw new OcrError(
+    "All available analysis services are currently unavailable. Please try again.",
+    503,
+  );
 }
 
 function parseJson<T>(raw: string): T | undefined {
