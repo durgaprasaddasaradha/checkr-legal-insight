@@ -29,6 +29,9 @@ const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const VISION_MODEL = "google/gemini-3.7-flash";
 
+/** Maximum time allowed for one AI provider request. */
+const AI_TIMEOUT_MS = 30_000;
+
 /** Optional external OCR service (FastAPI + OpenCV + PaddleOCR + YOLO). */
 const OCR_ENDPOINT = process.env["OCR_SERVICE_URL"] ?? "";
 
@@ -53,6 +56,27 @@ export class OcrError extends Error {
 /* Gateway plumbing                                                    */
 /* ------------------------------------------------------------------ */
 
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs = AI_TIMEOUT_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function gateway(body: Record<string, unknown>): Promise<string> {
   const { lovableApiKey, visionProvider } = await import("./server-env.server");
 
@@ -73,7 +97,9 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
 
   if (openRouterKey) {
     try {
-      const response = await fetch(OPENROUTER_URL, {
+      console.log("[gateway] Trying OpenRouter...");
+
+      const response = await fetchWithTimeout(OPENROUTER_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${openRouterKey}`,
@@ -99,18 +125,22 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
         const content = payload.choices?.[0]?.message?.content;
 
         if (content && content.trim()) {
+          console.log("[gateway] OpenRouter succeeded");
           return content;
         }
+
+        console.warn("[gateway] OpenRouter returned empty content");
       } else {
         const errorText = await response.text().catch(() => "");
-        console.error(
+
+        console.warn(
           `[gateway] OpenRouter failed (${response.status}):`,
           errorText.slice(0, 500),
         );
       }
     } catch (error) {
-      console.error(
-        "[gateway] OpenRouter request failed, trying backup provider",
+      console.warn(
+        "[gateway] OpenRouter failed or timed out, trying backup provider",
         error,
       );
     }
@@ -122,7 +152,9 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
 
   if (apiKey) {
     try {
-      const response = await fetch(GATEWAY_URL, {
+      console.log("[gateway] Trying Lovable AI...");
+
+      const response = await fetchWithTimeout(GATEWAY_URL, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -143,18 +175,22 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
         const content = payload.choices?.[0]?.message?.content;
 
         if (content && content.trim()) {
+          console.log("[gateway] Lovable AI succeeded");
           return content;
         }
+
+        console.warn("[gateway] Lovable AI returned empty content");
       } else {
         const errorText = await response.text().catch(() => "");
-        console.error(
+
+        console.warn(
           `[gateway] Lovable AI failed (${response.status}):`,
           errorText.slice(0, 500),
         );
       }
     } catch (error) {
-      console.error(
-        "[gateway] Lovable AI request failed, trying backup provider",
+      console.warn(
+        "[gateway] Lovable AI failed or timed out, trying backup provider",
         error,
       );
     }
@@ -166,12 +202,16 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
 
   if (fallback) {
     try {
+      console.log(
+        `[gateway] Trying backup provider: ${fallback.model}`,
+      );
+
       const payloadBody = {
         ...body,
         model: fallback.model,
       };
 
-      const response = await fetch(fallback.url, {
+      const response = await fetchWithTimeout(fallback.url, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${fallback.key}`,
@@ -192,17 +232,26 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
         const content = payload.choices?.[0]?.message?.content;
 
         if (content && content.trim()) {
+          console.log("[gateway] Backup provider succeeded");
           return content;
         }
+
+        console.warn(
+          "[gateway] Backup provider returned empty content",
+        );
       } else {
         const errorText = await response.text().catch(() => "");
-        console.error(
+
+        console.warn(
           `[gateway] Backup AI failed (${response.status}):`,
           errorText.slice(0, 500),
         );
       }
     } catch (error) {
-      console.error("[gateway] Backup AI provider failed", error);
+      console.warn(
+        "[gateway] Backup AI provider failed or timed out",
+        error,
+      );
     }
   }
 
@@ -377,8 +426,6 @@ async function runOcr(
   const raw = await gateway({
     model: "openrouter/free",
 
-    // Important:
-    // Ask OpenRouter/free models to return machine-readable JSON.
     response_format: {
       type: "json_object",
     },
@@ -953,8 +1000,6 @@ ${lines}`;
     await gateway({
       model: "openrouter/free",
 
-      // Important:
-      // Force structured JSON output where supported.
       response_format: {
         type: "json_object",
       },
