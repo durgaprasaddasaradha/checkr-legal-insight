@@ -155,7 +155,7 @@ async function gateway(
   }
 
   /* -------------------------------------------------------------- */
-  /* 1. OpenRouter                                                   */
+  /* 1. OpenRouter — primary                                        */
   /* -------------------------------------------------------------- */
 
   if (openRouterKey) {
@@ -206,19 +206,23 @@ async function gateway(
             payload,
           );
 
+        // OpenRouter can return HTTP 200 with a model response
+        // that is not usable JSON. Do not stop the fallback chain
+        // in that case.
         if (
           content &&
-          content.trim()
+          parseJson<Record<string, unknown>>(
+            content,
+          )
         ) {
           console.log(
             "[gateway] OpenRouter succeeded",
           );
-
           return content;
         }
 
         console.error(
-          "[gateway] OpenRouter returned empty content",
+          "[gateway] OpenRouter returned non-JSON content; trying backup.",
         );
       } else {
         const errorText =
@@ -240,7 +244,7 @@ async function gateway(
   }
 
   /* -------------------------------------------------------------- */
-  /* 2. Lovable AI Gateway                                          */
+  /* 2. Lovable AI Gateway — fallback                               */
   /* -------------------------------------------------------------- */
 
   if (apiKey) {
@@ -288,14 +292,19 @@ async function gateway(
 
         if (
           content &&
-          content.trim()
+          parseJson<Record<string, unknown>>(
+            content,
+          )
         ) {
           console.log(
             "[gateway] Lovable AI succeeded",
           );
-
           return content;
         }
+
+        console.error(
+          "[gateway] Lovable AI returned non-JSON content; trying backup.",
+        );
       } else {
         const errorText =
           await response
@@ -316,7 +325,7 @@ async function gateway(
   }
 
   /* -------------------------------------------------------------- */
-  /* 3. Gemini / OpenAI backup                                      */
+  /* 3. Gemini / OpenAI — final fallback                            */
   /* -------------------------------------------------------------- */
 
   if (fallback) {
@@ -324,11 +333,6 @@ async function gateway(
       console.log(
         "[gateway] Trying backup AI provider...",
       );
-
-      const payloadBody = {
-        ...body,
-        model: fallback.model,
-      };
 
       const response =
         await fetchWithTimeout(
@@ -341,9 +345,10 @@ async function gateway(
               "Content-Type":
                 "application/json",
             },
-            body: JSON.stringify(
-              payloadBody,
-            ),
+            body: JSON.stringify({
+              ...body,
+              model: fallback.model,
+            }),
           },
         );
 
@@ -369,14 +374,19 @@ async function gateway(
 
         if (
           content &&
-          content.trim()
+          parseJson<Record<string, unknown>>(
+            content,
+          )
         ) {
           console.log(
             "[gateway] Backup AI succeeded",
           );
-
           return content;
         }
+
+        console.error(
+          "[gateway] Backup AI returned non-JSON content.",
+        );
       } else {
         const errorText =
           await response
@@ -478,7 +488,7 @@ function parseJson<T>(
       )
       .trim();
 
-  /* First attempt: complete JSON */
+  /* First attempt: direct JSON */
   try {
     return JSON.parse(
       cleaned,
@@ -487,7 +497,27 @@ function parseJson<T>(
     // Continue.
   }
 
-  /* Second attempt: embedded object */
+  /* Second attempt: quoted JSON string */
+  try {
+    const decoded =
+      JSON.parse(cleaned);
+
+    if (
+      typeof decoded === "string"
+    ) {
+      try {
+        return JSON.parse(
+          decoded,
+        ) as T;
+      } catch {
+        // Continue.
+      }
+    }
+  } catch {
+    // Continue.
+  }
+
+  /* Third attempt: JSON object embedded in prose */
   const start =
     cleaned.indexOf("{");
 
@@ -502,15 +532,12 @@ function parseJson<T>(
     return undefined;
   }
 
-  const candidate =
-    cleaned.slice(
-      start,
-      end + 1,
-    );
-
   try {
     return JSON.parse(
-      candidate,
+      cleaned.slice(
+        start,
+        end + 1,
+      ),
     ) as T;
   } catch {
     return undefined;
@@ -596,7 +623,7 @@ async function runExternalOcr(
   dataUrl: string,
 ) {
   const response =
-    await fetch(
+    await fetchWithTimeout(
       `${OCR_ENDPOINT.replace(
         /\/$/,
         "",
@@ -1201,14 +1228,11 @@ export async function runInspection(
   }
 
   /* -------------------------------------------------------------- */
-  /* Load rules early                                                */
+  /* Start rules loading in parallel with OCR                        */
   /* -------------------------------------------------------------- */
 
-  const {
-    rules,
-    version,
-  } =
-    await loadActiveRules();
+  const rulesPromise =
+    loadActiveRules();
 
   /* -------------------------------------------------------------- */
   /* Stage 1 — storage + OCR                                        */
@@ -1363,6 +1387,12 @@ ${lines}`;
   /* -------------------------------------------------------------- */
   /* Stage 2 — rule engine                                          */
   /* -------------------------------------------------------------- */
+
+  const {
+    rules,
+    version,
+  } =
+    await rulesPromise;
 
   const raw =
     await gateway({
