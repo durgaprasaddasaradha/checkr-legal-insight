@@ -1,8 +1,8 @@
 // Inspection pipeline (server-only).
 //
-//   image  →  quality check  →  preprocessing hooks  →  OCR (tokens +
-//   confidence + bounding boxes)  →  declaration extraction  →  product
-//   category  →  versioned rule engine  →  screening result + evidence
+// image → quality check → preprocessing hooks → OCR (tokens +
+// confidence + bounding boxes) → declaration extraction → product
+// category → versioned rule engine → screening result + evidence
 //
 // PROVIDER BOUNDARY
 // ----------------
@@ -23,17 +23,26 @@ import type {
   ScreeningStatus,
   Severity,
 } from "./compliance-data";
-import { loadActiveRules, ruleApplies, type RuleRow } from "./rules.server";
 
-const GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
-const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const VISION_MODEL = "google/gemini-3.7-flash";
+import {
+  loadActiveRules,
+  ruleApplies,
+  type RuleRow,
+} from "./rules.server";
 
-/** Maximum time allowed for one AI provider request. */
-const AI_TIMEOUT_MS = 30_000;
+const GATEWAY_URL =
+  "https://ai.gateway.lovable.dev/v1/chat/completions";
 
-/** Optional external OCR service (FastAPI + OpenCV + PaddleOCR + YOLO). */
-const OCR_ENDPOINT = process.env["OCR_SERVICE_URL"] ?? "";
+const OPENROUTER_URL =
+  "https://openrouter.ai/api/v1/chat/completions";
+
+const VISION_MODEL =
+  "google/gemini-3.7-flash";
+
+const OCR_ENDPOINT =
+  process.env["OCR_SERVICE_URL"] ?? "";
+
+const AI_TIMEOUT_MS = 40000;
 
 export type ScanFileInput = {
   path: string;
@@ -45,7 +54,10 @@ export type ScanFileInput = {
 export class OcrError extends Error {
   status: number;
 
-  constructor(message: string, status = 500) {
+  constructor(
+    message: string,
+    status = 500,
+  ) {
     super(message);
     this.name = "OcrError";
     this.status = status;
@@ -56,35 +68,203 @@ export class OcrError extends Error {
 /* Gateway plumbing                                                    */
 /* ------------------------------------------------------------------ */
 
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit,
-  timeoutMs = AI_TIMEOUT_MS,
-): Promise<Response> {
-  const controller = new AbortController();
+type GatewayMessageContent =
+  | string
+  | {
+      type?: string;
+      text?: string;
+      content?: string;
+    }[];
 
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
-
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
+function extractMessageContent(
+  message: unknown,
+): string | undefined {
+  if (
+    !message ||
+    typeof message !== "object"
+  ) {
+    return undefined;
   }
+
+  const record =
+    message as {
+      content?: GatewayMessageContent;
+      text?: string;
+    };
+
+  const content =
+    record.content;
+
+  if (
+    typeof content === "string" &&
+    content.trim()
+  ) {
+    return content.trim();
+  }
+
+  if (
+    Array.isArray(content)
+  ) {
+    const text = content
+      .map((part) => {
+        if (
+          typeof part === "string"
+        ) {
+          return part;
+        }
+
+        if (
+          part &&
+          typeof part === "object"
+        ) {
+          if (
+            typeof part.text ===
+            "string"
+          ) {
+            return part.text;
+          }
+
+          if (
+            typeof part.content ===
+            "string"
+          ) {
+            return part.content;
+          }
+        }
+
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+
+    if (text) {
+      return text;
+    }
+  }
+
+  if (
+    typeof record.text ===
+      "string" &&
+    record.text.trim()
+  ) {
+    return record.text.trim();
+  }
+
+  return undefined;
 }
 
-async function gateway(body: Record<string, unknown>): Promise<string> {
-  const { lovableApiKey, visionProvider } = await import("./server-env.server");
+function createTimeoutSignal(
+  milliseconds: number,
+): AbortSignal {
+  return AbortSignal.timeout(
+    milliseconds,
+  );
+}
 
-  const openRouterKey = process.env["OPENROUTER_API_KEY"];
-  const apiKey = lovableApiKey();
-  const fallback = visionProvider();
+async function readProviderContent(
+  response: Response,
+): Promise<string | undefined> {
+  let payload: unknown;
 
-  if (!openRouterKey && !apiKey && !fallback) {
+  try {
+    payload =
+      await response.json();
+  } catch {
+    return undefined;
+  }
+
+  if (
+    !payload ||
+    typeof payload !==
+      "object"
+  ) {
+    return undefined;
+  }
+
+  const record =
+    payload as {
+      choices?: unknown[];
+      output?: unknown;
+      content?: unknown;
+    };
+
+  if (
+    Array.isArray(
+      record.choices,
+    )
+  ) {
+    for (const choice of record.choices) {
+      if (
+        !choice ||
+        typeof choice !==
+          "object"
+      ) {
+        continue;
+      }
+
+      const choiceRecord =
+        choice as {
+          message?: unknown;
+          text?: unknown;
+        };
+
+      const messageText =
+        extractMessageContent(
+          choiceRecord.message,
+        );
+
+      if (messageText) {
+        return messageText;
+      }
+
+      if (
+        typeof choiceRecord.text ===
+          "string" &&
+        choiceRecord.text.trim()
+      ) {
+        return choiceRecord.text.trim();
+      }
+    }
+  }
+
+  if (
+    typeof record.content ===
+      "string" &&
+    record.content.trim()
+  ) {
+    return record.content.trim();
+  }
+
+  return undefined;
+}
+
+async function gateway(
+  body: Record<string, unknown>,
+): Promise<string> {
+  const {
+    lovableApiKey,
+    visionProvider,
+  } = await import(
+    "./server-env.server"
+  );
+
+  const openRouterKey =
+    process.env[
+      "OPENROUTER_API_KEY"
+    ];
+
+  const apiKey =
+    lovableApiKey();
+
+  const fallback =
+    visionProvider();
+
+  if (
+    !openRouterKey &&
+    !apiKey &&
+    !fallback
+  ) {
     throw new OcrError(
       "The analysis service is not configured on this deployment. Set OPENROUTER_API_KEY, LOVABLE_API_KEY, or GEMINI_API_KEY / OPENAI_API_KEY.",
       401,
@@ -92,164 +272,233 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
   }
 
   /* -------------------------------------------------------------- */
-  /* 1. OpenRouter free router                                      */
+  /* 1. OpenRouter                                                   */
   /* -------------------------------------------------------------- */
 
   if (openRouterKey) {
     try {
-      console.log("[gateway] Trying OpenRouter...");
+      console.log(
+        "[gateway] Trying OpenRouter...",
+      );
 
-      const response = await fetchWithTimeout(OPENROUTER_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${openRouterKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://checkr-legal-insight.vercel.app",
-          "X-Title": "PackWise Compliance",
-        },
-        body: JSON.stringify({
-          ...body,
-          model: "openrouter/free",
-        }),
-      });
+      const response =
+        await fetch(
+          OPENROUTER_URL,
+          {
+            method: "POST",
+            headers: {
+              Authorization:
+                `Bearer ${openRouterKey}`,
+              "Content-Type":
+                "application/json",
+              "HTTP-Referer":
+                "https://checkr-legal-insight.vercel.app",
+              "X-Title":
+                "PackWise Compliance",
+            },
+            body: JSON.stringify({
+              ...body,
+              model:
+                "openrouter/free",
+            }),
+            signal:
+              createTimeoutSignal(
+                AI_TIMEOUT_MS,
+              ),
+          },
+        );
 
       if (response.ok) {
-        const payload = (await response.json()) as {
-          choices?: {
-            message?: {
-              content?: string;
-            };
-          }[];
-        };
+        const content =
+          await readProviderContent(
+            response,
+          );
 
-        const content = payload.choices?.[0]?.message?.content;
+        if (
+          content &&
+          content.trim()
+        ) {
+          console.log(
+            "[gateway] OpenRouter succeeded",
+          );
 
-        if (content && content.trim()) {
-          console.log("[gateway] OpenRouter succeeded");
-          return content;
+          return content.trim();
         }
 
-        console.warn("[gateway] OpenRouter returned empty content");
+        console.error(
+          "[gateway] OpenRouter returned an empty or unsupported response",
+        );
       } else {
-        const errorText = await response.text().catch(() => "");
+        const errorText =
+          await response
+            .text()
+            .catch(() => "");
 
-        console.warn(
+        console.error(
           `[gateway] OpenRouter failed (${response.status}):`,
-          errorText.slice(0, 500),
+          errorText.slice(
+            0,
+            1000,
+          ),
         );
       }
     } catch (error) {
-      console.warn(
-        "[gateway] OpenRouter failed or timed out, trying backup provider",
+      console.error(
+        "[gateway] OpenRouter request failed, trying backup provider",
         error,
       );
     }
   }
 
   /* -------------------------------------------------------------- */
-  /* 2. Existing Lovable AI Gateway                                */
+  /* 2. Lovable AI Gateway                                           */
   /* -------------------------------------------------------------- */
 
   if (apiKey) {
     try {
-      console.log("[gateway] Trying Lovable AI...");
+      console.log(
+        "[gateway] Trying Lovable AI...",
+      );
 
-      const response = await fetchWithTimeout(GATEWAY_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
+      const response =
+        await fetch(
+          GATEWAY_URL,
+          {
+            method: "POST",
+            headers: {
+              Authorization:
+                `Bearer ${apiKey}`,
+              "Content-Type":
+                "application/json",
+            },
+            body:
+              JSON.stringify(
+                body,
+              ),
+            signal:
+              createTimeoutSignal(
+                AI_TIMEOUT_MS,
+              ),
+          },
+        );
 
       if (response.ok) {
-        const payload = (await response.json()) as {
-          choices?: {
-            message?: {
-              content?: string;
-            };
-          }[];
-        };
+        const content =
+          await readProviderContent(
+            response,
+          );
 
-        const content = payload.choices?.[0]?.message?.content;
+        if (
+          content &&
+          content.trim()
+        ) {
+          console.log(
+            "[gateway] Lovable AI succeeded",
+          );
 
-        if (content && content.trim()) {
-          console.log("[gateway] Lovable AI succeeded");
-          return content;
+          return content.trim();
         }
 
-        console.warn("[gateway] Lovable AI returned empty content");
+        console.error(
+          "[gateway] Lovable AI returned an empty or unsupported response",
+        );
       } else {
-        const errorText = await response.text().catch(() => "");
+        const errorText =
+          await response
+            .text()
+            .catch(() => "");
 
-        console.warn(
+        console.error(
           `[gateway] Lovable AI failed (${response.status}):`,
-          errorText.slice(0, 500),
+          errorText.slice(
+            0,
+            1000,
+          ),
         );
       }
     } catch (error) {
-      console.warn(
-        "[gateway] Lovable AI failed or timed out, trying backup provider",
+      console.error(
+        "[gateway] Lovable AI request failed, trying backup provider",
         error,
       );
     }
   }
 
   /* -------------------------------------------------------------- */
-  /* 3. Gemini / OpenAI backup                                      */
+  /* 3. Gemini / OpenAI backup                                       */
   /* -------------------------------------------------------------- */
 
   if (fallback) {
     try {
       console.log(
-        `[gateway] Trying backup provider: ${fallback.model}`,
+        "[gateway] Trying backup AI...",
       );
 
       const payloadBody = {
         ...body,
-        model: fallback.model,
+        model:
+          fallback.model,
       };
 
-      const response = await fetchWithTimeout(fallback.url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${fallback.key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payloadBody),
-      });
+      const response =
+        await fetch(
+          fallback.url,
+          {
+            method: "POST",
+            headers: {
+              Authorization:
+                `Bearer ${fallback.key}`,
+              "Content-Type":
+                "application/json",
+            },
+            body:
+              JSON.stringify(
+                payloadBody,
+              ),
+            signal:
+              createTimeoutSignal(
+                AI_TIMEOUT_MS,
+              ),
+          },
+        );
 
       if (response.ok) {
-        const payload = (await response.json()) as {
-          choices?: {
-            message?: {
-              content?: string;
-            };
-          }[];
-        };
+        const content =
+          await readProviderContent(
+            response,
+          );
 
-        const content = payload.choices?.[0]?.message?.content;
+        if (
+          content &&
+          content.trim()
+        ) {
+          console.log(
+            "[gateway] Backup AI succeeded",
+          );
 
-        if (content && content.trim()) {
-          console.log("[gateway] Backup provider succeeded");
-          return content;
+          return content.trim();
         }
 
-        console.warn(
-          "[gateway] Backup provider returned empty content",
+        console.error(
+          "[gateway] Backup AI returned an empty or unsupported response",
         );
       } else {
-        const errorText = await response.text().catch(() => "");
+        const errorText =
+          await response
+            .text()
+            .catch(() => "");
 
-        console.warn(
+        console.error(
           `[gateway] Backup AI failed (${response.status}):`,
-          errorText.slice(0, 500),
+          errorText.slice(
+            0,
+            1000,
+          ),
         );
       }
     } catch (error) {
-      console.warn(
-        "[gateway] Backup AI provider failed or timed out",
+      console.error(
+        "[gateway] Backup AI provider failed",
         error,
       );
     }
@@ -265,35 +514,84 @@ async function gateway(body: Record<string, unknown>): Promise<string> {
 /* JSON parsing                                                        */
 /* ------------------------------------------------------------------ */
 
-function parseJson<T>(raw: string): T | undefined {
-  if (!raw || typeof raw !== "string") return undefined;
+function parseJson<T>(
+  raw: string,
+): T | undefined {
+  if (
+    !raw ||
+    typeof raw !== "string"
+  ) {
+    return undefined;
+  }
 
-  let cleaned = raw.trim();
+  let cleaned =
+    raw.trim();
 
-  cleaned = cleaned
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
+  cleaned =
+    cleaned
+      .replace(
+        /^```(?:json)?\s*/i,
+        "",
+      )
+      .replace(
+        /\s*```$/i,
+        "",
+      )
+      .trim();
 
   try {
-    return JSON.parse(cleaned) as T;
+    return JSON.parse(
+      cleaned,
+    ) as T;
   } catch {
     // Continue with embedded JSON extraction.
   }
 
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
+  const objectStart =
+    cleaned.indexOf("{");
 
-  if (start === -1 || end === -1 || end <= start) {
-    return undefined;
+  const objectEnd =
+    cleaned.lastIndexOf("}");
+
+  if (
+    objectStart !== -1 &&
+    objectEnd > objectStart
+  ) {
+    try {
+      return JSON.parse(
+        cleaned.slice(
+          objectStart,
+          objectEnd + 1,
+        ),
+      ) as T;
+    } catch {
+      // Continue.
+    }
   }
 
-  try {
-    return JSON.parse(cleaned.slice(start, end + 1)) as T;
-  } catch {
-    return undefined;
+  const arrayStart =
+    cleaned.indexOf("[");
+
+  const arrayEnd =
+    cleaned.lastIndexOf("]");
+
+  if (
+    arrayStart !== -1 &&
+    arrayEnd > arrayStart
+  ) {
+    try {
+      return JSON.parse(
+        cleaned.slice(
+          arrayStart,
+          arrayEnd + 1,
+        ),
+      ) as T;
+    } catch {
+      // Continue.
+    }
   }
+
+  return undefined;
 }
 
 /* ------------------------------------------------------------------ */
@@ -362,20 +660,34 @@ Rules:
 - If the image contains partially readable text, transcribe only what can reasonably be read and reduce confidence.
 - "poor" means the label text cannot be relied on; explain why in issues.`;
 
-/** Swap this for the FastAPI/PaddleOCR service when it is available. */
-async function runExternalOcr(file: ScanFileInput, dataUrl: string) {
-  const response = await fetch(`${OCR_ENDPOINT.replace(/\/$/, "")}/ocr`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      name: file.name,
-      side: file.side,
-      mime: file.mime,
-      image: dataUrl,
-    }),
-  });
+async function runExternalOcr(
+  file: ScanFileInput,
+  dataUrl: string,
+) {
+  const response =
+    await fetch(
+      `${OCR_ENDPOINT.replace(
+        /\/$/,
+        "",
+      )}/ocr`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          name: file.name,
+          side: file.side,
+          mime: file.mime,
+          image: dataUrl,
+        }),
+        signal:
+          createTimeoutSignal(
+            AI_TIMEOUT_MS,
+          ),
+      },
+    );
 
   if (!response.ok) {
     throw new OcrError(
@@ -391,6 +703,7 @@ type OcrPayload = {
   quality?: Partial<ImageQuality>;
   language?: string;
   text?: string;
+
   tokens?: {
     text?: string;
     confidence?: number;
@@ -404,16 +717,22 @@ async function runOcr(
   dataUrl: string,
 ): Promise<OcrPayload> {
   if (OCR_ENDPOINT) {
-    return runExternalOcr(file, dataUrl);
+    return runExternalOcr(
+      file,
+      dataUrl,
+    );
   }
 
   const block =
-    file.mime === "application/pdf"
+    file.mime ===
+    "application/pdf"
       ? {
           type: "file",
           file: {
-            filename: file.name,
-            file_data: dataUrl,
+            filename:
+              file.name,
+            file_data:
+              dataUrl,
           },
         }
       : {
@@ -423,37 +742,46 @@ async function runOcr(
           },
         };
 
-  const raw = await gateway({
-    model: "openrouter/free",
+  const raw =
+    await gateway({
+      model:
+        "openrouter/free",
 
-    response_format: {
-      type: "json_object",
-    },
-
-    messages: [
-      {
-        role: "system",
-        content: OCR_PROMPT,
+      response_format: {
+        type: "json_object",
       },
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `This is the ${file.side} side of the package. Assess the image quality and transcribe all readable package text.`,
-          },
-          block,
-        ],
-      },
-    ],
-  });
 
-  const parsed = parseJson<OcrPayload>(raw);
+      messages: [
+        {
+          role: "system",
+          content:
+            OCR_PROMPT,
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `This is the ${file.side} side of the package. Assess the image quality and transcribe all readable package text.`,
+            },
+            block,
+          ],
+        },
+      ],
+    });
+
+  const parsed =
+    parseJson<OcrPayload>(
+      raw,
+    );
 
   if (!parsed) {
     console.error(
       "[runOcr] Could not parse AI response:",
-      raw.slice(0, 1000),
+      raw.slice(
+        0,
+        2000,
+      ),
     );
 
     throw new OcrError(
@@ -469,20 +797,24 @@ async function runOcr(
 /* OCR normalization                                                   */
 /* ------------------------------------------------------------------ */
 
-function clampPct(n: unknown, fallback = 0): number {
+function clampPct(
+  n: unknown,
+  fallback = 0,
+): number {
   const v =
-    typeof n === "number" && Number.isFinite(n)
+    typeof n === "number" &&
+    Number.isFinite(n)
       ? n
       : fallback;
 
   return Math.round(
-    Math.min(100, Math.max(0, v)),
+    Math.min(
+      100,
+      Math.max(0, v),
+    ),
   );
 }
 
-/**
- * Normalize a model-reported box to 0–1 fractions.
- */
 function normBox(
   b: Partial<BBox> | undefined,
 ): BBox {
@@ -492,12 +824,17 @@ function normBox(
     b?.w,
     b?.h,
   ].map((n) =>
-    typeof n === "number" && Number.isFinite(n)
+    typeof n === "number" &&
+    Number.isFinite(n)
       ? n
       : NaN,
   );
 
-  if (nums.some((n) => Number.isNaN(n))) {
+  if (
+    nums.some(
+      (n) => Number.isNaN(n),
+    )
+  ) {
     return {
       x: 0,
       y: 0,
@@ -506,9 +843,10 @@ function normBox(
     };
   }
 
-  const max = Math.max(
-    ...nums.map(Math.abs),
-  );
+  const max =
+    Math.max(
+      ...nums.map(Math.abs),
+    );
 
   const divisor =
     max <= 1.001
@@ -519,10 +857,18 @@ function normBox(
           ? 4000
           : max;
 
-  const [x, y, w, h] = nums.map((n) =>
+  const [
+    x,
+    y,
+    w,
+    h,
+  ] = nums.map((n) =>
     Math.min(
       1,
-      Math.max(0, n / divisor),
+      Math.max(
+        0,
+        n / divisor,
+      ),
     ),
   ) as [
     number,
@@ -548,8 +894,14 @@ function normBox(
   return {
     x,
     y,
-    w: Math.min(w, 1 - x),
-    h: Math.min(h, 1 - y),
+    w: Math.min(
+      w,
+      1 - x,
+    ),
+    h: Math.min(
+      h,
+      1 - y,
+    ),
   };
 }
 
@@ -557,73 +909,105 @@ function toPage(
   file: ScanFileInput,
   payload: OcrPayload,
 ): InspectionPage {
-  const tokens: OcrToken[] = (
-    payload.tokens ?? []
-  )
-    .map((t) => ({
-      text: (t.text ?? "").trim(),
+  const tokens: OcrToken[] =
+    (
+      payload.tokens ??
+      []
+    )
+      .map((t) => ({
+        text:
+          (
+            t.text ??
+            ""
+          ).trim(),
 
-      confidence: clampPct(
-        t.confidence,
-        70,
-      ),
+        confidence:
+          clampPct(
+            t.confidence,
+            70,
+          ),
 
-      language:
-        t.language?.trim() ||
-        payload.language?.trim() ||
-        "en",
+        language:
+          t.language?.trim() ||
+          payload.language?.trim() ||
+          "en",
 
-      bbox: normBox(t.bbox),
-    }))
-    .filter(
-      (t) => t.text.length > 0,
-    );
+        bbox:
+          normBox(
+            t.bbox,
+          ),
+      }))
+      .filter(
+        (t) =>
+          t.text.length >
+          0,
+      );
 
-  const q = payload.quality ?? {};
+  const q =
+    payload.quality ??
+    {};
 
   const verdict =
-    q.verdict === "good" ||
-    q.verdict === "warning" ||
-    q.verdict === "poor"
+    q.verdict ===
+      "good" ||
+    q.verdict ===
+      "warning" ||
+    q.verdict ===
+      "poor"
       ? q.verdict
       : "warning";
 
   const text =
-    (payload.text ?? "").trim();
+    (
+      payload.text ??
+      ""
+    ).trim();
 
-  const quality: ImageQuality = {
+  const quality:
+    ImageQuality = {
     verdict:
-      text.length === 0
+      text.length ===
+      0
         ? "poor"
         : verdict,
 
-    score: clampPct(
-      q.score,
-      verdict === "good"
-        ? 85
-        : 55,
-    ),
+    score:
+      clampPct(
+        q.score,
+        verdict ===
+          "good"
+          ? 85
+          : 55,
+      ),
 
     issues:
-      Array.isArray(q.issues)
+      Array.isArray(
+        q.issues,
+      )
         ? q.issues.filter(
-            (i): i is string =>
-              typeof i === "string",
+            (
+              i,
+            ): i is string =>
+              typeof i ===
+              "string",
           )
         : [],
 
     resolution:
-      typeof q.resolution === "string"
+      typeof q.resolution ===
+      "string"
         ? q.resolution
         : "unknown",
 
     orientation:
-      typeof q.orientation === "string"
+      typeof q.orientation ===
+      "string"
         ? q.orientation
         : "unknown",
 
     note:
-      typeof q.note === "string"
+      typeof q.note ===
+      "string"
         ? q.note
         : "",
   };
@@ -632,7 +1016,9 @@ function toPage(
     name: file.name,
     path: file.path,
     side: file.side,
-    ok: text.length > 0,
+    ok:
+      text.length >
+      0,
     text,
     tokens,
     quality,
@@ -682,13 +1068,14 @@ function enginePrompt(
   rules: RuleRow[],
   version: string,
 ): string {
-  const catalogue = rules
-    .map(
-      (r) =>
-        `${r.rule_code} | declaration=${r.declaration_type} | severity=${r.severity} | applies_to=${(r.applicability ?? []).join(",")} | method=${r.validation_method} | ref=${r.source_ref}
+  const catalogue =
+    rules
+      .map(
+        (r) =>
+          `${r.rule_code} | declaration=${r.declaration_type} | severity=${r.severity} | applies_to=${(r.applicability ?? []).join(",")} | method=${r.validation_method} | ref=${r.source_ref}
     ${r.requirement}`,
-    )
-    .join("\n");
+      )
+      .join("\n");
 
   return `You are the declaration-extraction and rule-checking stage of a Legal Metrology inspection platform in India.
 
@@ -774,9 +1161,12 @@ Hard rules:
 function normStatus(
   v: unknown,
 ): ScreeningStatus {
-  return v === "pass" ||
-    v === "review" ||
-    v === "potential-violation"
+  return v ===
+    "pass" ||
+    v ===
+      "review" ||
+    v ===
+      "potential-violation"
     ? v
     : "review";
 }
@@ -784,14 +1174,16 @@ function normStatus(
 function normSeverity(
   v: unknown,
 ): Severity {
-  return v === "high" ||
-    v === "medium" ||
-    v === "low"
+  return v ===
+    "high" ||
+    v ===
+      "medium" ||
+    v ===
+      "low"
     ? v
     : "medium";
 }
 
-/** Locate the OCR token that best matches an extracted value. */
 function locate(
   pages: InspectionPage[],
   source: string,
@@ -799,21 +1191,29 @@ function locate(
 ) {
   const page =
     pages.find(
-      (p) => p.name === source,
-    ) ?? pages[0];
+      (p) =>
+        p.name ===
+        source,
+    ) ??
+    pages[0];
 
   if (!page) {
     return undefined;
   }
 
-  const needle = value
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  const needle =
+    value
+      .toLowerCase()
+      .replace(
+        /\s+/g,
+        " ",
+      )
+      .trim();
 
   if (
     !needle ||
-    needle === "not detected"
+    needle ===
+      "not detected"
   ) {
     return {
       page,
@@ -822,17 +1222,21 @@ function locate(
   }
 
   const token =
-    page.tokens.find((t) =>
-      t.text
-        .toLowerCase()
-        .includes(needle),
+    page.tokens.find(
+      (t) =>
+        t.text
+          .toLowerCase()
+          .includes(
+            needle,
+          ),
     ) ??
     page.tokens.find(
       (t) =>
         needle.includes(
           t.text.toLowerCase(),
         ) &&
-        t.text.length > 2,
+        t.text.length >
+          2,
     );
 
   return {
@@ -849,19 +1253,27 @@ export async function runInspection(
   inspector: string,
 ): Promise<Inspection> {
   /* -------------------------------------------------------------- */
-  /* Stage 1 — quality + OCR                                       */
+  /* Stage 1 — quality + OCR                                        */
   /* -------------------------------------------------------------- */
 
-  const pages: InspectionPage[] = [];
+  const pages:
+    InspectionPage[] =
+    [];
 
-  for (const file of files) {
+  for (
+    const file of files
+  ) {
     let dataUrl: string;
 
     try {
-      dataUrl = await fetchBytes(file);
+      dataUrl =
+        await fetchBytes(
+          file,
+        );
     } catch (error) {
       const detail =
-        error instanceof Error
+        error instanceof
+        Error
           ? error.message
           : String(error);
 
@@ -904,7 +1316,8 @@ export async function runInspection(
       pages.push(
         failedPage(
           file,
-          error instanceof OcrError
+          error instanceof
+            OcrError
             ? error.message
             : "OCR failed for this file.",
         ),
@@ -916,18 +1329,23 @@ export async function runInspection(
     pages.filter(
       (p) =>
         p.ok &&
-        p.tokens.length > 0,
+        p.tokens.length >
+          0,
     );
 
-  if (readable.length === 0) {
-    const poor = pages
-      .map((p) =>
-        p.quality.issues.join(
-          "; ",
-        ),
-      )
-      .filter(Boolean)
-      .join(" · ");
+  if (
+    readable.length ===
+    0
+  ) {
+    const poor =
+      pages
+        .map((p) =>
+          p.quality.issues.join(
+            "; ",
+          ),
+        )
+        .filter(Boolean)
+        .join(" · ");
 
     throw new OcrError(
       `Insufficient readable information — please capture clearer images of the package.${
@@ -946,42 +1364,48 @@ export async function runInspection(
   const seen =
     new Set<string>();
 
-  const merged = readable
-    .map((p) => {
-      const lines =
-        p.tokens
-          .filter((t) => {
-            const key =
-              t.text
-                .toLowerCase()
-                .replace(
-                  /[^a-z0-9₹.]/g,
-                  "",
-                );
+  const merged =
+    readable
+      .map((p) => {
+        const lines =
+          p.tokens
+            .filter((t) => {
+              const key =
+                t.text
+                  .toLowerCase()
+                  .replace(
+                    /[^a-z0-9₹.]/g,
+                    "",
+                  );
 
-            if (key.length <= 3) {
+              if (
+                key.length <= 3
+              ) {
+                return true;
+              }
+
+              if (
+                seen.has(
+                  key,
+                )
+              ) {
+                return false;
+              }
+
+              seen.add(key);
+
               return true;
-            }
+            })
+            .map(
+              (t) =>
+                `  [conf ${t.confidence}%] ${t.text}`,
+            )
+            .join("\n");
 
-            if (
-              seen.has(key)
-            ) {
-              return false;
-            }
-
-            seen.add(key);
-            return true;
-          })
-          .map(
-            (t) =>
-              `  [conf ${t.confidence}%] ${t.text}`,
-          )
-          .join("\n");
-
-      return `FILE: ${p.name} (side: ${p.side}, capture quality: ${p.quality.verdict})
+        return `FILE: ${p.name} (side: ${p.side}, capture quality: ${p.quality.verdict})
 ${lines}`;
-    })
-    .join("\n\n");
+      })
+      .join("\n\n");
 
   /* -------------------------------------------------------------- */
   /* Load Legal Metrology rules                                    */
@@ -990,15 +1414,17 @@ ${lines}`;
   const {
     rules,
     version,
-  } = await loadActiveRules();
+  } =
+    await loadActiveRules();
 
   /* -------------------------------------------------------------- */
-  /* Stage 2 AI rule engine                                       */
+  /* Stage 2 AI rule engine                                        */
   /* -------------------------------------------------------------- */
 
   const raw =
     await gateway({
-      model: "openrouter/free",
+      model:
+        "openrouter/free",
 
       response_format: {
         type: "json_object",
@@ -1029,7 +1455,10 @@ ${lines}`;
   if (!engine) {
     console.error(
       "[runInspection] Could not parse rule-engine response:",
-      raw.slice(0, 1500),
+      raw.slice(
+        0,
+        2000,
+      ),
     );
 
     throw new OcrError(
@@ -1039,7 +1468,8 @@ ${lines}`;
   }
 
   if (
-    engine.usable === false
+    engine.usable ===
+    false
   ) {
     throw new OcrError(
       engine.reason?.trim() ||
@@ -1098,10 +1528,12 @@ ${lines}`;
         value,
 
         detected:
-          d.detected === true,
+          d.detected ===
+          true,
 
         applicable:
-          d.applicable !== false,
+          d.applicable !==
+          false,
 
         ocrConfidence:
           clampPct(
@@ -1140,7 +1572,8 @@ ${lines}`;
   /* -------------------------------------------------------------- */
 
   const findings:
-    RuleFinding[] = [];
+    RuleFinding[] =
+    [];
 
   (
     engine.findings ??
@@ -1185,7 +1618,8 @@ ${lines}`;
             );
 
       findings.push({
-        id: `f${i + 1}`,
+        id:
+          `f${i + 1}`,
 
         ruleCode:
           rule.rule_code,
@@ -1234,7 +1668,8 @@ ${lines}`;
         recommendation:
           f.recommendation?.trim() ||
           (
-            status === "pass"
+            status ===
+            "pass"
               ? "No action required."
               : "Manual verification by the inspecting officer."
           ),
@@ -1249,7 +1684,8 @@ ${lines}`;
   );
 
   if (
-    findings.length === 0
+    findings.length ===
+    0
   ) {
     throw new OcrError(
       "No applicable rule checks could be derived from the extracted text.",
@@ -1286,9 +1722,11 @@ ${lines}`;
 
   const screening:
     ScreeningStatus =
-    counts.violation > 0
+    counts.violation >
+    0
       ? "potential-violation"
-      : counts.review > 0
+      : counts.review >
+          0
         ? "review"
         : "pass";
 
@@ -1301,7 +1739,8 @@ ${lines}`;
       (f) =>
         f.status ===
           "potential-violation" &&
-        f.severity === "high",
+        f.severity ===
+          "high",
     ).length;
 
   const poorCaptures =
@@ -1316,8 +1755,10 @@ ${lines}`;
     highSeverity >= 2 ||
     counts.violation >= 4
       ? "high"
-      : counts.violation > 0 ||
-          counts.review >= 3 ||
+      : counts.violation >
+            0 ||
+          counts.review >=
+            3 ||
           poorCaptures > 0
         ? "medium"
         : "low";
@@ -1327,11 +1768,12 @@ ${lines}`;
   /* -------------------------------------------------------------- */
 
   return {
-    id: `LM-${new Date().getFullYear()}-${Math.floor(
-      Math.random() *
-        900000 +
-        100000,
-    )}`,
+    id:
+      `LM-${new Date().getFullYear()}-${Math.floor(
+        Math.random() *
+          900000 +
+          100000,
+      )}`,
 
     mode: "real",
 
@@ -1387,20 +1829,34 @@ function failedPage(
     name: file.name,
     path: file.path,
     side: file.side,
+
     ok: false,
+
     text: "",
+
     tokens: [],
 
     quality: {
-      verdict: "poor",
+      verdict:
+        "poor",
+
       score: 0,
-      issues: [error],
-      resolution: "unknown",
-      orientation: "unknown",
+
+      issues: [
+        error,
+      ],
+
+      resolution:
+        "unknown",
+
+      orientation:
+        "unknown",
+
       note: error,
     },
 
     language: "en",
+
     error,
   };
 }
