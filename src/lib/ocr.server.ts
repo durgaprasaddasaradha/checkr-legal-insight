@@ -90,13 +90,8 @@ async function fetchWithTimeout(
   options: RequestInit,
   timeoutMs = AI_TIMEOUT_MS,
 ): Promise<Response> {
-  const controller =
-    new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs,
-  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     return await fetch(url, {
@@ -113,11 +108,49 @@ async function fetchWithTimeout(
         504,
       );
     }
-
     throw error;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function readResponseTextWithTimeout(
+  response: Response,
+  timeoutMs = AI_TIMEOUT_MS,
+): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new OcrError(
+          "The analysis service took too long to return its result.",
+          504,
+        ),
+      );
+    }, timeoutMs);
+
+    response.text().then(
+      (text) => {
+        clearTimeout(timer);
+        resolve(text);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function parseGatewayPayload(text: string): {
+  choices?: {
+    message?: {
+      content?:
+        | string
+        | { type?: string; text?: string }[];
+    };
+  }[];
+} {
+  return JSON.parse(text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -187,19 +220,8 @@ async function gateway(
         );
 
       if (response.ok) {
-        const payload =
-          (await response.json()) as {
-            choices?: {
-              message?: {
-                content?:
-                  | string
-                  | {
-                      type?: string;
-                      text?: string;
-                    }[];
-              };
-            }[];
-          };
+        const responseText = await readResponseTextWithTimeout(response);
+        const payload = parseGatewayPayload(responseText);
 
         const content =
           extractMessageContent(
@@ -271,19 +293,8 @@ async function gateway(
         );
 
       if (response.ok) {
-        const payload =
-          (await response.json()) as {
-            choices?: {
-              message?: {
-                content?:
-                  | string
-                  | {
-                      type?: string;
-                      text?: string;
-                    }[];
-              };
-            }[];
-          };
+        const responseText = await readResponseTextWithTimeout(response);
+        const payload = parseGatewayPayload(responseText);
 
         const content =
           extractMessageContent(
@@ -353,19 +364,8 @@ async function gateway(
         );
 
       if (response.ok) {
-        const payload =
-          (await response.json()) as {
-            choices?: {
-              message?: {
-                content?:
-                  | string
-                  | {
-                      type?: string;
-                      text?: string;
-                    }[];
-              };
-            }[];
-          };
+        const responseText = await readResponseTextWithTimeout(response);
+        const payload = parseGatewayPayload(responseText);
 
         const content =
           extractMessageContent(
