@@ -1,15 +1,22 @@
 // Inspection pipeline (server-only).
 //
-// image → quality check → preprocessing hooks → OCR (tokens +
-// confidence + bounding boxes) → declaration extraction → product
-// category → versioned rule engine → screening result + evidence
+// image → quality check → OCR → declaration extraction
+//       → product category → versioned rule engine
+//       → screening result + evidence
+//
+// SPEED OPTIMIZATIONS
+// -------------------
+// 1. OCR requests for multiple images run in parallel.
+// 2. Every AI request has a hard timeout.
+// 3. OpenRouter is tried first.
+// 4. Lovable AI Gateway is used as fallback.
+// 5. Gemini/OpenAI is used as final fallback.
+// 6. OpenRouter responses are parsed defensively.
 //
 // PROVIDER BOUNDARY
 // ----------------
-// `runOcr()` is the ONLY place that talks to an OCR provider. Today it uses a
-// vision model through OpenRouter/Lovable/Gemini. To move to the recommended
-// Python stack (FastAPI + OpenCV preprocessing + PaddleOCR, optionally YOLO
-// region detection), set OCR_ENDPOINT and implement `runExternalOcr()`.
+// runOcr() is the ONLY place that talks to an OCR provider.
+// External OCR can be enabled with OCR_SERVICE_URL.
 
 import type {
   BBox,
@@ -39,10 +46,20 @@ const OPENROUTER_URL =
 const VISION_MODEL =
   "google/gemini-3.7-flash";
 
+/**
+ * Optional external OCR service.
+ * Leave empty to use OpenRouter/Lovable/Gemini.
+ */
 const OCR_ENDPOINT =
   process.env["OCR_SERVICE_URL"] ?? "";
 
-const AI_TIMEOUT_MS = 40000;
+/**
+ * Maximum time allowed for one AI request.
+ *
+ * This prevents a request from sitting until Vercel's
+ * 300 second serverless timeout.
+ */
+const AI_TIMEOUT_MS = 35_000;
 
 export type ScanFileInput = {
   path: string;
@@ -65,179 +82,47 @@ export class OcrError extends Error {
 }
 
 /* ------------------------------------------------------------------ */
-/* Gateway plumbing                                                    */
+/* Timeout helper                                                     */
 /* ------------------------------------------------------------------ */
 
-type GatewayMessageContent =
-  | string
-  | {
-      type?: string;
-      text?: string;
-      content?: string;
-    }[];
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs = AI_TIMEOUT_MS,
+): Promise<Response> {
+  const controller =
+    new AbortController();
 
-function extractMessageContent(
-  message: unknown,
-): string | undefined {
-  if (
-    !message ||
-    typeof message !== "object"
-  ) {
-    return undefined;
-  }
-
-  const record =
-    message as {
-      content?: GatewayMessageContent;
-      text?: string;
-    };
-
-  const content =
-    record.content;
-
-  if (
-    typeof content === "string" &&
-    content.trim()
-  ) {
-    return content.trim();
-  }
-
-  if (
-    Array.isArray(content)
-  ) {
-    const text = content
-      .map((part) => {
-        if (
-          typeof part === "string"
-        ) {
-          return part;
-        }
-
-        if (
-          part &&
-          typeof part === "object"
-        ) {
-          if (
-            typeof part.text ===
-            "string"
-          ) {
-            return part.text;
-          }
-
-          if (
-            typeof part.content ===
-            "string"
-          ) {
-            return part.content;
-          }
-        }
-
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-
-    if (text) {
-      return text;
-    }
-  }
-
-  if (
-    typeof record.text ===
-      "string" &&
-    record.text.trim()
-  ) {
-    return record.text.trim();
-  }
-
-  return undefined;
-}
-
-function createTimeoutSignal(
-  milliseconds: number,
-): AbortSignal {
-  return AbortSignal.timeout(
-    milliseconds,
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs,
   );
-}
-
-async function readProviderContent(
-  response: Response,
-): Promise<string | undefined> {
-  let payload: unknown;
 
   try {
-    payload =
-      await response.json();
-  } catch {
-    return undefined;
-  }
-
-  if (
-    !payload ||
-    typeof payload !==
-      "object"
-  ) {
-    return undefined;
-  }
-
-  const record =
-    payload as {
-      choices?: unknown[];
-      output?: unknown;
-      content?: unknown;
-    };
-
-  if (
-    Array.isArray(
-      record.choices,
-    )
-  ) {
-    for (const choice of record.choices) {
-      if (
-        !choice ||
-        typeof choice !==
-          "object"
-      ) {
-        continue;
-      }
-
-      const choiceRecord =
-        choice as {
-          message?: unknown;
-          text?: unknown;
-        };
-
-      const messageText =
-        extractMessageContent(
-          choiceRecord.message,
-        );
-
-      if (messageText) {
-        return messageText;
-      }
-
-      if (
-        typeof choiceRecord.text ===
-          "string" &&
-        choiceRecord.text.trim()
-      ) {
-        return choiceRecord.text.trim();
-      }
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.name === "AbortError"
+    ) {
+      throw new OcrError(
+        "The analysis service took too long to respond.",
+        504,
+      );
     }
-  }
 
-  if (
-    typeof record.content ===
-      "string" &&
-    record.content.trim()
-  ) {
-    return record.content.trim();
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return undefined;
 }
+
+/* ------------------------------------------------------------------ */
+/* Gateway plumbing                                                   */
+/* ------------------------------------------------------------------ */
 
 async function gateway(
   body: Record<string, unknown>,
@@ -250,9 +135,7 @@ async function gateway(
   );
 
   const openRouterKey =
-    process.env[
-      "OPENROUTER_API_KEY"
-    ];
+    process.env["OPENROUTER_API_KEY"];
 
   const apiKey =
     lovableApiKey();
@@ -282,7 +165,7 @@ async function gateway(
       );
 
       const response =
-        await fetch(
+        await fetchWithTimeout(
           OPENROUTER_URL,
           {
             method: "POST",
@@ -298,20 +181,29 @@ async function gateway(
             },
             body: JSON.stringify({
               ...body,
-              model:
-                "openrouter/free",
+              model: "openrouter/free",
             }),
-            signal:
-              createTimeoutSignal(
-                AI_TIMEOUT_MS,
-              ),
           },
         );
 
       if (response.ok) {
+        const payload =
+          (await response.json()) as {
+            choices?: {
+              message?: {
+                content?:
+                  | string
+                  | {
+                      type?: string;
+                      text?: string;
+                    }[];
+              };
+            }[];
+          };
+
         const content =
-          await readProviderContent(
-            response,
+          extractMessageContent(
+            payload,
           );
 
         if (
@@ -322,11 +214,11 @@ async function gateway(
             "[gateway] OpenRouter succeeded",
           );
 
-          return content.trim();
+          return content;
         }
 
         console.error(
-          "[gateway] OpenRouter returned an empty or unsupported response",
+          "[gateway] OpenRouter returned empty content",
         );
       } else {
         const errorText =
@@ -336,22 +228,19 @@ async function gateway(
 
         console.error(
           `[gateway] OpenRouter failed (${response.status}):`,
-          errorText.slice(
-            0,
-            1000,
-          ),
+          errorText.slice(0, 500),
         );
       }
     } catch (error) {
       console.error(
-        "[gateway] OpenRouter request failed, trying backup provider",
+        "[gateway] OpenRouter failed, trying backup provider:",
         error,
       );
     }
   }
 
   /* -------------------------------------------------------------- */
-  /* 2. Lovable AI Gateway                                           */
+  /* 2. Lovable AI Gateway                                          */
   /* -------------------------------------------------------------- */
 
   if (apiKey) {
@@ -361,7 +250,7 @@ async function gateway(
       );
 
       const response =
-        await fetch(
+        await fetchWithTimeout(
           GATEWAY_URL,
           {
             method: "POST",
@@ -371,21 +260,30 @@ async function gateway(
               "Content-Type":
                 "application/json",
             },
-            body:
-              JSON.stringify(
-                body,
-              ),
-            signal:
-              createTimeoutSignal(
-                AI_TIMEOUT_MS,
-              ),
+            body: JSON.stringify(
+              body,
+            ),
           },
         );
 
       if (response.ok) {
+        const payload =
+          (await response.json()) as {
+            choices?: {
+              message?: {
+                content?:
+                  | string
+                  | {
+                      type?: string;
+                      text?: string;
+                    }[];
+              };
+            }[];
+          };
+
         const content =
-          await readProviderContent(
-            response,
+          extractMessageContent(
+            payload,
           );
 
         if (
@@ -396,12 +294,8 @@ async function gateway(
             "[gateway] Lovable AI succeeded",
           );
 
-          return content.trim();
+          return content;
         }
-
-        console.error(
-          "[gateway] Lovable AI returned an empty or unsupported response",
-        );
       } else {
         const errorText =
           await response
@@ -410,38 +304,34 @@ async function gateway(
 
         console.error(
           `[gateway] Lovable AI failed (${response.status}):`,
-          errorText.slice(
-            0,
-            1000,
-          ),
+          errorText.slice(0, 500),
         );
       }
     } catch (error) {
       console.error(
-        "[gateway] Lovable AI request failed, trying backup provider",
+        "[gateway] Lovable AI failed, trying backup provider:",
         error,
       );
     }
   }
 
   /* -------------------------------------------------------------- */
-  /* 3. Gemini / OpenAI backup                                       */
+  /* 3. Gemini / OpenAI backup                                      */
   /* -------------------------------------------------------------- */
 
   if (fallback) {
     try {
       console.log(
-        "[gateway] Trying backup AI...",
+        "[gateway] Trying backup AI provider...",
       );
 
       const payloadBody = {
         ...body,
-        model:
-          fallback.model,
+        model: fallback.model,
       };
 
       const response =
-        await fetch(
+        await fetchWithTimeout(
           fallback.url,
           {
             method: "POST",
@@ -451,21 +341,30 @@ async function gateway(
               "Content-Type":
                 "application/json",
             },
-            body:
-              JSON.stringify(
-                payloadBody,
-              ),
-            signal:
-              createTimeoutSignal(
-                AI_TIMEOUT_MS,
-              ),
+            body: JSON.stringify(
+              payloadBody,
+            ),
           },
         );
 
       if (response.ok) {
+        const payload =
+          (await response.json()) as {
+            choices?: {
+              message?: {
+                content?:
+                  | string
+                  | {
+                      type?: string;
+                      text?: string;
+                    }[];
+              };
+            }[];
+          };
+
         const content =
-          await readProviderContent(
-            response,
+          extractMessageContent(
+            payload,
           );
 
         if (
@@ -476,12 +375,8 @@ async function gateway(
             "[gateway] Backup AI succeeded",
           );
 
-          return content.trim();
+          return content;
         }
-
-        console.error(
-          "[gateway] Backup AI returned an empty or unsupported response",
-        );
       } else {
         const errorText =
           await response
@@ -490,15 +385,12 @@ async function gateway(
 
         console.error(
           `[gateway] Backup AI failed (${response.status}):`,
-          errorText.slice(
-            0,
-            1000,
-          ),
+          errorText.slice(0, 500),
         );
       }
     } catch (error) {
       console.error(
-        "[gateway] Backup AI provider failed",
+        "[gateway] Backup AI provider failed:",
         error,
       );
     }
@@ -511,7 +403,50 @@ async function gateway(
 }
 
 /* ------------------------------------------------------------------ */
-/* JSON parsing                                                        */
+/* AI response extraction                                            */
+/* ------------------------------------------------------------------ */
+
+function extractMessageContent(
+  payload: {
+    choices?: {
+      message?: {
+        content?:
+          | string
+          | {
+              type?: string;
+              text?: string;
+            }[];
+      };
+    }[];
+  },
+): string {
+  const content =
+    payload.choices?.[0]
+      ?.message?.content;
+
+  if (
+    typeof content === "string"
+  ) {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        typeof part?.text ===
+        "string"
+          ? part.text
+          : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return "";
+}
+
+/* ------------------------------------------------------------------ */
+/* JSON parsing                                                       */
 /* ------------------------------------------------------------------ */
 
 function parseJson<T>(
@@ -530,7 +465,11 @@ function parseJson<T>(
   cleaned =
     cleaned
       .replace(
-        /^```(?:json)?\s*/i,
+        /^```json\s*/i,
+        "",
+      )
+      .replace(
+        /^```\s*/i,
         "",
       )
       .replace(
@@ -539,66 +478,51 @@ function parseJson<T>(
       )
       .trim();
 
+  /* First attempt: complete JSON */
   try {
     return JSON.parse(
       cleaned,
     ) as T;
   } catch {
-    // Continue with embedded JSON extraction.
+    // Continue.
   }
 
-  const objectStart =
+  /* Second attempt: embedded object */
+  const start =
     cleaned.indexOf("{");
 
-  const objectEnd =
+  const end =
     cleaned.lastIndexOf("}");
 
   if (
-    objectStart !== -1 &&
-    objectEnd > objectStart
+    start === -1 ||
+    end === -1 ||
+    end <= start
   ) {
-    try {
-      return JSON.parse(
-        cleaned.slice(
-          objectStart,
-          objectEnd + 1,
-        ),
-      ) as T;
-    } catch {
-      // Continue.
-    }
+    return undefined;
   }
 
-  const arrayStart =
-    cleaned.indexOf("[");
+  const candidate =
+    cleaned.slice(
+      start,
+      end + 1,
+    );
 
-  const arrayEnd =
-    cleaned.lastIndexOf("]");
-
-  if (
-    arrayStart !== -1 &&
-    arrayEnd > arrayStart
-  ) {
-    try {
-      return JSON.parse(
-        cleaned.slice(
-          arrayStart,
-          arrayEnd + 1,
-        ),
-      ) as T;
-    } catch {
-      // Continue.
-    }
+  try {
+    return JSON.parse(
+      candidate,
+    ) as T;
+  } catch {
+    return undefined;
   }
-
-  return undefined;
 }
 
 /* ------------------------------------------------------------------ */
-/* Stage 1 — image quality check + OCR                                */
+/* Stage 1 — image quality + OCR                                     */
 /* ------------------------------------------------------------------ */
 
-const OCR_PROMPT = `You are the image-quality and OCR stage of a Legal Metrology inspection pipeline.
+const OCR_PROMPT = `
+You are the image-quality and OCR stage of a Legal Metrology inspection pipeline.
 
 You receive ONE photograph of a packaged commodity.
 
@@ -607,11 +531,15 @@ Judge resolution, blur, glare, text visibility, package visibility and orientati
 
 STEP 2 — OCR.
 Transcribe every legible text region exactly as printed.
-Never translate, correct, complete or invent text.
+
+Never translate.
+Never correct.
+Never complete.
+Never invent text.
 
 Return STRICT JSON only.
 Do not return markdown.
-Do not return explanations outside the JSON.
+Do not return explanations outside JSON.
 
 Required JSON structure:
 
@@ -643,22 +571,25 @@ Required JSON structure:
 
 Rules:
 
-- "verdict" must be "good", "warning", or "poor".
-- "score" must be between 0 and 100.
-- "language" can be "en", "hi", "te", "mixed", or another appropriate language code.
-- "text" must contain only text actually visible in the image.
+- verdict must be "good", "warning", or "poor".
+- score must be between 0 and 100.
+- language can be "en", "hi", "te", "mixed", or another appropriate language code.
+- text must contain only text actually visible in the image.
 - Never invent missing words, numbers, prices, dates or declarations.
 - Each token must contain readable text.
 - confidence must be between 0 and 100.
 - bbox values must be normalized from 0 to 1.
-- bbox must represent the approximate location of the text in the image.
 - Never use pixel coordinates.
-- If nothing readable is visible, return:
-  "verdict": "poor",
-  "text": "",
-  "tokens": []
-- If the image contains partially readable text, transcribe only what can reasonably be read and reduce confidence.
-- "poor" means the label text cannot be relied on; explain why in issues.`;
+- If nothing readable is visible:
+  verdict = "poor"
+  text = ""
+  tokens = []
+- If text is partially readable, transcribe only what can reasonably be read and reduce confidence.
+`;
+
+/* ------------------------------------------------------------------ */
+/* External OCR                                                       */
+/* ------------------------------------------------------------------ */
 
 async function runExternalOcr(
   file: ScanFileInput,
@@ -682,10 +613,6 @@ async function runExternalOcr(
           mime: file.mime,
           image: dataUrl,
         }),
-        signal:
-          createTimeoutSignal(
-            AI_TIMEOUT_MS,
-          ),
       },
     );
 
@@ -703,7 +630,6 @@ type OcrPayload = {
   quality?: Partial<ImageQuality>;
   language?: string;
   text?: string;
-
   tokens?: {
     text?: string;
     confidence?: number;
@@ -711,6 +637,10 @@ type OcrPayload = {
     bbox?: Partial<BBox>;
   }[];
 };
+
+/* ------------------------------------------------------------------ */
+/* OCR                                                               */
+/* ------------------------------------------------------------------ */
 
 async function runOcr(
   file: ScanFileInput,
@@ -744,9 +674,6 @@ async function runOcr(
 
   const raw =
     await gateway({
-      model:
-        "openrouter/free",
-
       response_format: {
         type: "json_object",
       },
@@ -762,7 +689,7 @@ async function runOcr(
           content: [
             {
               type: "text",
-              text: `This is the ${file.side} side of the package. Assess the image quality and transcribe all readable package text.`,
+              text: `This is the ${file.side} side of the package. Assess image quality and transcribe all readable package text.`,
             },
             block,
           ],
@@ -778,10 +705,7 @@ async function runOcr(
   if (!parsed) {
     console.error(
       "[runOcr] Could not parse AI response:",
-      raw.slice(
-        0,
-        2000,
-      ),
+      raw.slice(0, 1500),
     );
 
     throw new OcrError(
@@ -794,7 +718,7 @@ async function runOcr(
 }
 
 /* ------------------------------------------------------------------ */
-/* OCR normalization                                                   */
+/* OCR normalization                                                  */
 /* ------------------------------------------------------------------ */
 
 function clampPct(
@@ -816,7 +740,9 @@ function clampPct(
 }
 
 function normBox(
-  b: Partial<BBox> | undefined,
+  b:
+    | Partial<BBox>
+    | undefined,
 ): BBox {
   const nums = [
     b?.x,
@@ -824,15 +750,16 @@ function normBox(
     b?.w,
     b?.h,
   ].map((n) =>
-    typeof n === "number" &&
+    typeof n ===
+      "number" &&
     Number.isFinite(n)
       ? n
       : NaN,
   );
 
   if (
-    nums.some(
-      (n) => Number.isNaN(n),
+    nums.some((n) =>
+      Number.isNaN(n),
     )
   ) {
     return {
@@ -916,10 +843,8 @@ function toPage(
     )
       .map((t) => ({
         text:
-          (
-            t.text ??
-            ""
-          ).trim(),
+          (t.text ?? "")
+            .trim(),
 
         confidence:
           clampPct(
@@ -966,8 +891,7 @@ function toPage(
   const quality:
     ImageQuality = {
     verdict:
-      text.length ===
-      0
+      text.length === 0
         ? "poor"
         : verdict,
 
@@ -1017,8 +941,7 @@ function toPage(
     path: file.path,
     side: file.side,
     ok:
-      text.length >
-      0,
+      text.length > 0,
     text,
     tokens,
     quality,
@@ -1029,7 +952,7 @@ function toPage(
 }
 
 /* ------------------------------------------------------------------ */
-/* Stage 2 — extraction + versioned rule engine                        */
+/* Engine output                                                      */
 /* ------------------------------------------------------------------ */
 
 type EngineOutput = {
@@ -1064,6 +987,10 @@ type EngineOutput = {
   }[];
 };
 
+/* ------------------------------------------------------------------ */
+/* Rule engine prompt                                                  */
+/* ------------------------------------------------------------------ */
+
 function enginePrompt(
   rules: RuleRow[],
   version: string,
@@ -1072,19 +999,26 @@ function enginePrompt(
     rules
       .map(
         (r) =>
-          `${r.rule_code} | declaration=${r.declaration_type} | severity=${r.severity} | applies_to=${(r.applicability ?? []).join(",")} | method=${r.validation_method} | ref=${r.source_ref}
-    ${r.requirement}`,
+          `${r.rule_code} | declaration=${r.declaration_type} | severity=${r.severity} | applies_to=${(
+            r.applicability ??
+            []
+          ).join(",")} | method=${r.validation_method} | ref=${r.source_ref}
+${r.requirement}`,
       )
       .join("\n");
 
-  return `You are the declaration-extraction and rule-checking stage of a Legal Metrology inspection platform in India.
+  return `
+You are the declaration-extraction and rule-checking stage of a Legal Metrology inspection platform in India.
 
 You receive OCR output from one or more photographed sides of the SAME package.
+
 Treat all sides as one commodity.
 
-RULE CATALOGUE (ruleset version ${version}) — evaluate ONLY these rules:
+RULE CATALOGUE (ruleset version ${version}):
 
 ${catalogue}
+
+Evaluate ONLY these rules.
 
 Return STRICT JSON only.
 Do not return markdown.
@@ -1105,6 +1039,7 @@ Required JSON structure:
 }
 
 categoryKey must be one of:
+
 "food"
 "personal-care"
 "household"
@@ -1140,7 +1075,7 @@ Finding structure:
 
 Hard rules:
 
-- Use ONLY the supplied OCR text.
+- Use ONLY supplied OCR text.
 - NEVER invent a value.
 - Emit one finding for EVERY catalogue rule that applies to the detected category.
 - Skip rules that do not apply.
@@ -1151,20 +1086,19 @@ Hard rules:
 - source must be an exact supplied filename.
 - Never state a final legal conclusion.
 - These are automated screening outcomes only.
-- If information is missing, use "Not detected" rather than inventing it.`;
+- If information is missing, use "Not detected" rather than inventing it.
+`;
 }
 
 /* ------------------------------------------------------------------ */
-/* Orchestration                                                       */
+/* Status helpers                                                      */
 /* ------------------------------------------------------------------ */
 
 function normStatus(
   v: unknown,
 ): ScreeningStatus {
-  return v ===
-    "pass" ||
-    v ===
-      "review" ||
+  return v === "pass" ||
+    v === "review" ||
     v ===
       "potential-violation"
     ? v
@@ -1174,15 +1108,16 @@ function normStatus(
 function normSeverity(
   v: unknown,
 ): Severity {
-  return v ===
-    "high" ||
-    v ===
-      "medium" ||
-    v ===
-      "low"
+  return v === "high" ||
+    v === "medium" ||
+    v === "low"
     ? v
     : "medium";
 }
+
+/* ------------------------------------------------------------------ */
+/* Locate OCR evidence                                                */
+/* ------------------------------------------------------------------ */
 
 function locate(
   pages: InspectionPage[],
@@ -1192,8 +1127,7 @@ function locate(
   const page =
     pages.find(
       (p) =>
-        p.name ===
-        source,
+        p.name === source,
     ) ??
     pages[0];
 
@@ -1245,6 +1179,10 @@ function locate(
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Main inspection                                                     */
+/* ------------------------------------------------------------------ */
+
 export async function runInspection(
   files: ScanFileInput[],
   fetchBytes: (
@@ -1252,78 +1190,96 @@ export async function runInspection(
   ) => Promise<string>,
   inspector: string,
 ): Promise<Inspection> {
-  /* -------------------------------------------------------------- */
-  /* Stage 1 — quality + OCR                                        */
-  /* -------------------------------------------------------------- */
-
-  const pages:
-    InspectionPage[] =
-    [];
-
-  for (
-    const file of files
+  if (
+    !files ||
+    files.length === 0
   ) {
-    let dataUrl: string;
-
-    try {
-      dataUrl =
-        await fetchBytes(
-          file,
-        );
-    } catch (error) {
-      const detail =
-        error instanceof
-        Error
-          ? error.message
-          : String(error);
-
-      console.error(
-        "[runInspection] storage read failed",
-        file.path,
-        detail,
-      );
-
-      pages.push(
-        failedPage(
-          file,
-          `The uploaded file could not be read from storage (${detail}).`,
-        ),
-      );
-
-      continue;
-    }
-
-    try {
-      const ocrResult =
-        await runOcr(
-          file,
-          dataUrl,
-        );
-
-      pages.push(
-        toPage(
-          file,
-          ocrResult,
-        ),
-      );
-    } catch (error) {
-      console.error(
-        "[runInspection] OCR failed",
-        file.name,
-        error,
-      );
-
-      pages.push(
-        failedPage(
-          file,
-          error instanceof
-            OcrError
-            ? error.message
-            : "OCR failed for this file.",
-        ),
-      );
-    }
+    throw new OcrError(
+      "No package images were provided.",
+      400,
+    );
   }
+
+  /* -------------------------------------------------------------- */
+  /* Load rules early                                                */
+  /* -------------------------------------------------------------- */
+
+  const {
+    rules,
+    version,
+  } =
+    await loadActiveRules();
+
+  /* -------------------------------------------------------------- */
+  /* Stage 1 — storage + OCR                                        */
+  /*                                                                */
+  /* IMPORTANT SPEED CHANGE:                                       */
+  /* All package images are processed concurrently.                */
+  /* -------------------------------------------------------------- */
+
+  const pages =
+    await Promise.all(
+      files.map(
+        async (file) => {
+          let dataUrl: string;
+
+          try {
+            dataUrl =
+              await fetchBytes(
+                file,
+              );
+          } catch (error) {
+            const detail =
+              error instanceof
+              Error
+                ? error.message
+                : String(error);
+
+            console.error(
+              "[runInspection] storage read failed",
+              file.path,
+              detail,
+            );
+
+            return failedPage(
+              file,
+              `The uploaded file could not be read from storage (${detail}).`,
+            );
+          }
+
+          try {
+            const ocrResult =
+              await runOcr(
+                file,
+                dataUrl,
+              );
+
+            return toPage(
+              file,
+              ocrResult,
+            );
+          } catch (error) {
+            console.error(
+              "[runInspection] OCR failed",
+              file.name,
+              error,
+            );
+
+            return failedPage(
+              file,
+              error instanceof
+                OcrError
+                ? error.message
+                : "OCR failed for this file.",
+            );
+          }
+        },
+      ),
+    );
+
+  /* -------------------------------------------------------------- */
+  /* Check readable pages                                           */
+  /* -------------------------------------------------------------- */
 
   const readable =
     pages.filter(
@@ -1334,8 +1290,7 @@ export async function runInspection(
     );
 
   if (
-    readable.length ===
-    0
+    readable.length === 0
   ) {
     const poor =
       pages
@@ -1358,7 +1313,7 @@ export async function runInspection(
   }
 
   /* -------------------------------------------------------------- */
-  /* Stage 2 — merged OCR payload                                  */
+  /* Merge OCR output                                                */
   /* -------------------------------------------------------------- */
 
   const seen =
@@ -1385,9 +1340,7 @@ export async function runInspection(
               }
 
               if (
-                seen.has(
-                  key,
-                )
+                seen.has(key)
               ) {
                 return false;
               }
@@ -1408,24 +1361,11 @@ ${lines}`;
       .join("\n\n");
 
   /* -------------------------------------------------------------- */
-  /* Load Legal Metrology rules                                    */
-  /* -------------------------------------------------------------- */
-
-  const {
-    rules,
-    version,
-  } =
-    await loadActiveRules();
-
-  /* -------------------------------------------------------------- */
-  /* Stage 2 AI rule engine                                        */
+  /* Stage 2 — rule engine                                          */
   /* -------------------------------------------------------------- */
 
   const raw =
     await gateway({
-      model:
-        "openrouter/free",
-
       response_format: {
         type: "json_object",
       },
@@ -1442,7 +1382,9 @@ ${lines}`;
         {
           role: "user",
           content:
-            `OCR output from the uploaded package sides:\n\n${merged}`,
+            `OCR output from the uploaded package sides:
+
+${merged}`,
         },
       ],
     });
@@ -1455,10 +1397,7 @@ ${lines}`;
   if (!engine) {
     console.error(
       "[runInspection] Could not parse rule-engine response:",
-      raw.slice(
-        0,
-        2000,
-      ),
+      raw.slice(0, 1500),
     );
 
     throw new OcrError(
@@ -1491,7 +1430,7 @@ ${lines}`;
     );
 
   /* -------------------------------------------------------------- */
-  /* Declarations                                                   */
+  /* Declarations                                                    */
   /* -------------------------------------------------------------- */
 
   const declarations:
@@ -1568,12 +1507,11 @@ ${lines}`;
     });
 
   /* -------------------------------------------------------------- */
-  /* Findings                                                       */
+  /* Findings                                                        */
   /* -------------------------------------------------------------- */
 
   const findings:
-    RuleFinding[] =
-    [];
+    RuleFinding[] = [];
 
   (
     engine.findings ??
@@ -1684,8 +1622,7 @@ ${lines}`;
   );
 
   if (
-    findings.length ===
-    0
+    findings.length === 0
   ) {
     throw new OcrError(
       "No applicable rule checks could be derived from the extracted text.",
@@ -1694,7 +1631,7 @@ ${lines}`;
   }
 
   /* -------------------------------------------------------------- */
-  /* Screening result                                               */
+  /* Screening result                                                */
   /* -------------------------------------------------------------- */
 
   const counts = {
@@ -1722,16 +1659,14 @@ ${lines}`;
 
   const screening:
     ScreeningStatus =
-    counts.violation >
-    0
+    counts.violation > 0
       ? "potential-violation"
-      : counts.review >
-          0
+      : counts.review > 0
         ? "review"
         : "pass";
 
   /* -------------------------------------------------------------- */
-  /* Inspection prioritisation                                      */
+  /* Priority                                                        */
   /* -------------------------------------------------------------- */
 
   const highSeverity =
@@ -1755,16 +1690,14 @@ ${lines}`;
     highSeverity >= 2 ||
     counts.violation >= 4
       ? "high"
-      : counts.violation >
-            0 ||
-          counts.review >=
-            3 ||
+      : counts.violation > 0 ||
+          counts.review >= 3 ||
           poorCaptures > 0
         ? "medium"
         : "low";
 
   /* -------------------------------------------------------------- */
-  /* Final inspection object                                        */
+  /* Final inspection                                                */
   /* -------------------------------------------------------------- */
 
   return {
@@ -1837,14 +1770,11 @@ function failedPage(
     tokens: [],
 
     quality: {
-      verdict:
-        "poor",
+      verdict: "poor",
 
       score: 0,
 
-      issues: [
-        error,
-      ],
+      issues: [error],
 
       resolution:
         "unknown",
